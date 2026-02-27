@@ -4,6 +4,13 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
+
+from business.models import Business
+from business.serializers import BusinessSerializer
+from django.conf import settings
+from django.contrib.auth import login
+from receipts.models import Receipt
+from receipts.serializers import ReceiptListSerializer
 from .models import User
 from .serializers import (
     UserSerializer,
@@ -61,15 +68,22 @@ class UserViewSet(viewsets.ModelViewSet):
         user = serializer.save()
         
         refresh = RefreshToken.for_user(user)
+        access_token = str(refresh.access_token)
+        response = Response({
+        'user': UserSerializer(user).data,
+        'message': 'User registered successfully'
+    },  status=status.HTTP_201_CREATED)
+
+    # 3. Set the cookie on the response
+        response.set_cookie(
+            key=settings.SIMPLE_JWT['AUTH_COOKIE'],
+            value=access_token,
+            httponly=settings.SIMPLE_JWT['AUTH_COOKIE_HTTP_ONLY'],
+            secure=settings.SIMPLE_JWT['AUTH_COOKIE_SECURE'],
+            samesite=settings.SIMPLE_JWT['AUTH_COOKIE_SAMESITE'],
+        )
         
-        return Response({
-            'user': UserSerializer(user).data,
-            'tokens': {
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            },
-            'message': 'User registered successfully'
-        }, status=status.HTTP_201_CREATED)
+        return response
     
     @action(detail=False, methods=['post'])
     def login(self, request):
@@ -78,12 +92,8 @@ class UserViewSet(viewsets.ModelViewSet):
         password = request.data.get('password')
         
         if not email or not password:
-            return Response(
-                {'error': 'Please provide both email and password'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': 'Please provide both email and password'}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Authenticate using email (since USERNAME_FIELD is email)
         user = authenticate(request, email=email.lower(), password=password)
         
         if user is None:
@@ -98,16 +108,39 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        refresh = RefreshToken.for_user(user)
         
-        return Response({
+        refresh = RefreshToken.for_user(user)
+        access_token = str(refresh.access_token)
+        refresh_token = str(refresh)
+        
+        business = Business.objects.filter(owner=user).first()
+        receipts_qs = Receipt.objects.filter(business=business).order_by('-updated_at')[:50] if business else []
+        receipts_data = ReceiptListSerializer(receipts_qs, many=True).data
+        
+        # 2. Prepare Response
+        response = Response({
             'user': UserSerializer(user).data,
-            'tokens': {
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            },
-            'message': 'Login successful'
+            'business': BusinessSerializer(business).data if business else None,
+            'receipts': receipts_data,
+            'message': 'Login successful',
+            'access': access_token,
+            'refresh': refresh_token,
+        
         }, status=status.HTTP_200_OK)
+        
+        
+       # 3. Set Cookie (Matches your register logic)
+       
+       
+        # response.set_cookie(
+        #     key=settings.SIMPLE_JWT['AUTH_COOKIE'],
+        #     value=access_token,
+        #     httponly=settings.SIMPLE_JWT['AUTH_COOKIE_HTTP_ONLY'],
+        #     secure=settings.SIMPLE_JWT['AUTH_COOKIE_SECURE'],
+        #     samesite=settings.SIMPLE_JWT['AUTH_COOKIE_SAMESITE'],
+        # )
+        
+        return response
         
         
     @action(detail=False, methods=['get'], permission_classes=[permissions.IsAdminUser])
@@ -124,19 +157,28 @@ class UserViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['post'])
     def logout(self, request):
-        """POST /api/users/logout/ - Blacklist the refresh token"""
+        """POST /api/users/logout/"""
+        response = Response({'message': 'Logout successful'}, status=status.HTTP_200_OK)
+        
+        # Delete the cookie from the browser
+        response.delete_cookie(settings.SIMPLE_JWT['AUTH_COOKIE'])
+        
+        # Optional: Blacklist refresh token if provided
         try:
             refresh_token = request.data.get('refresh')
-            token = RefreshToken(refresh_token)
-            token.blacklist()
-            return Response({'message': 'Logout successful'}, status=status.HTTP_200_OK)
+            if refresh_token:
+                token = RefreshToken(refresh_token)
+                token.blacklist()
         except Exception:
-            return Response({'error': 'Invalid or missing refresh token'}, status=status.HTTP_400_BAD_REQUEST)
+            pass # Token might already be expired
+            
+        return response
+    
     
     @action(detail=False, methods=['get'])
     def me(self, request):
         """GET /api/users/me/"""
-        serializer = UserSerializer(request.user)
+        serializer = UserWithBusinessSerializer(request.user)
         return Response(serializer.data)
     
     @action(detail=False, methods=['post'])

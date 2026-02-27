@@ -5,6 +5,8 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework.pagination import CursorPagination
 from django.http import FileResponse
+
+from business.models import Business
 from .utils import *
 
 from .models import Receipt, SyncStatus
@@ -51,7 +53,7 @@ class ReceiptViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         """
-        Set initial sync status and link the user.
+        Standard creation (online mode).
         """
         serializer.save(sync_status=SyncStatus.SYNCED)
 
@@ -63,18 +65,14 @@ class ReceiptViewSet(viewsets.ModelViewSet):
         """
         receipts_data = request.data  # Expecting a list of receipt objects
         if not isinstance(receipts_data, list):
-            return Response(
-                {"error": "Expected a list of receipts"}, 
+            return Response({"error": "Expected a list of receipts"}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        results = {
-            "created": 0,
-            "updated": 0,
-            "errors": []
-        }
+        results = {"created": 0,"updated": 0,"errors": [] }
 
         for data in receipts_data:
+            items_data = data.pop('items', [])
             receipt_id = data.get('id')
             try:
                 # Check if receipt already exists (it might have been partially synced)
@@ -82,15 +80,31 @@ class ReceiptViewSet(viewsets.ModelViewSet):
                 
                 if instance:
                     serializer = ReceiptDetailSerializer(instance, data=data, partial=True)
-                    results["updated"] += 1
                 else:
+                    # CREATE new (using the client-side UUID)
                     serializer = ReceiptDetailSerializer(data=data)
-                    results["created"] += 1
                 
                 if serializer.is_valid():
-                    serializer.save(sync_status=SyncStatus.SYNCED)
+                    user_business = Business.objects.filter(owner=request.user).first()
+                    with transaction.atomic():
+                        receipt = serializer.save(sync_status=SyncStatus.SYNCED, business=user_business)
+                        
+                        # Handle Nested Items: Clear and Re-add to avoid duplicates
+                        receipt.items.all().delete() 
+                        for item in items_data:
+                            # Assuming you have a related_name='items' on your ReceiptItem model
+                            receipt.items.create(
+                                description=item.get('description'),
+                                quantity=item.get('quantity'),
+                                unitPrice=item.get('unitPrice'),
+                                total=item.get('total')
+                            )
+                        
+                        if instance: results["updated"] += 1 
+                        else: results["created"] += 1
                 else:
                     results["errors"].append({"id": receipt_id, "errors": serializer.errors})
+                    
             except Exception as e:
                 results["errors"].append({"id": receipt_id, "error": str(e)})
 

@@ -155,11 +155,15 @@ class AdminDashboardSerializer(serializers.Serializer):
     total_users = serializers.IntegerField()
     active_users = serializers.IntegerField()
     verified_users = serializers.IntegerField()
-    new_users_today = serializers.IntegerField()    
+    new_users_today = serializers.IntegerField()  
+      
     
 class UserWithBusinessSerializer(UserSerializer):
     
     from business.serializers import BusinessSerializer
+    business = BusinessSerializer(read_only=True)
+    
+    
     class Meta(UserSerializer.Meta):
         
         

@@ -55,7 +55,7 @@ class Receipt(models.Model):
     )
     
     receipt_number = models.CharField(max_length=50) # receiptNumber -> receipt_number
-    receipt_date = models.DateTimeField() # receiptDate -> receipt_date
+    receipt_date = models.DateField() # receiptDate -> receipt_date
     
     # Customer information
     customer_name = models.CharField(max_length=255) # customerName -> customer_name
