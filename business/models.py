@@ -34,7 +34,7 @@ class Business(models.Model):
     # Store URL for the logo
     logo_url = models.URLField(null=True, blank=True)
     
-    currency = models.CharField(max_length=10, default="USD")
+    currency = models.CharField(max_length=10, default="$")
     tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     tax_enabled = models.BooleanField(default=False)
     

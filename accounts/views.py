@@ -21,6 +21,16 @@ from .serializers import (
     UserWithBusinessSerializer,AdminDashboardSerializer
 )
 
+import os
+import requests
+from django.contrib.auth import get_user_model
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny
+from rest_framework_simplejwt.tokens import RefreshToken
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 class UserViewSet(viewsets.ModelViewSet):
     """
     ViewSet for User model handling Authentication and Profile management.
@@ -68,20 +78,27 @@ class UserViewSet(viewsets.ModelViewSet):
         user = serializer.save()
         
         refresh = RefreshToken.for_user(user)
-        access_token = str(refresh.access_token)
+        # access_token = str(refresh.access_token)
         response = Response({
         'user': UserSerializer(user).data,
+        'tokens': {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+        },
         'message': 'User registered successfully'
-    },  status=status.HTTP_201_CREATED)
+        },  status=status.HTTP_201_CREATED)
 
     # 3. Set the cookie on the response
-        response.set_cookie(
-            key=settings.SIMPLE_JWT['AUTH_COOKIE'],
-            value=access_token,
-            httponly=settings.SIMPLE_JWT['AUTH_COOKIE_HTTP_ONLY'],
-            secure=settings.SIMPLE_JWT['AUTH_COOKIE_SECURE'],
-            samesite=settings.SIMPLE_JWT['AUTH_COOKIE_SAMESITE'],
-        )
+
+        # cookie_name = settings.SIMPLE_JWT.get('AUTH_COOKIE') or 'access_token'
+       
+        # response.set_cookie(
+        #     key=cookie_name,
+        #     value=access_token,
+        #     httponly=settings.SIMPLE_JWT.get('AUTH_COOKIE_HTTP_ONLY', True),
+        #     secure=settings.SIMPLE_JWT.get('AUTH_COOKIE_SECURE', False), # Set True in Prod
+        #     samesite=settings.SIMPLE_JWT.get('AUTH_COOKIE_SAMESITE', 'Lax'),
+        # )
         
         return response
     
@@ -212,3 +229,101 @@ class UserViewSet(viewsets.ModelViewSet):
             'message': 'Notification preferences updated',
             'data': serializer.data
         }, status=status.HTTP_200_OK)
+        
+        
+        
+# Add this at the bottom of accounts/views.py
+
+class GoogleCallbackView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        code = request.data.get("code")
+
+        if not code:
+            return Response({"error": "Authorization code is required."}, status=400)
+
+        # ── Step 1: Exchange code for Google tokens ──────────────────────────
+        token_response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:3000/oauth/callback"),
+                "grant_type": "authorization_code",
+            },
+        )
+
+        if not token_response.ok:
+            return Response(
+                {"error": "Failed to exchange code with Google."},
+                status=400
+            )
+
+        token_data = token_response.json()
+        google_id_token_value = token_data.get("id_token")
+
+        if not google_id_token_value:
+            return Response({"error": "No ID token returned from Google."}, status=400)
+
+        # ── Step 2: Verify the ID token ──────────────────────────────────────
+        try:
+            user_info = id_token.verify_oauth2_token(
+                google_id_token_value,
+                google_requests.Request(),
+                os.getenv("GOOGLE_CLIENT_ID"),
+            )
+        except ValueError as e:
+            return Response({"error": f"Invalid Google token: {str(e)}"}, status=400)
+
+        # ── Step 3: Extract user info ────────────────────────────────────────
+        email = user_info.get("email")
+        first_name = user_info.get("given_name", "")
+        last_name = user_info.get("family_name", "")
+        avatar = user_info.get("picture", "")
+        email_verified = user_info.get("email_verified", False)
+
+        if not email:
+            return Response({"error": "Could not retrieve email from Google."}, status=400)
+
+        if not email_verified:
+            return Response({"error": "Google email is not verified."}, status=400)
+
+        # ── Step 4: Find or create user ──────────────────────────────────────
+        user, is_new = User.objects.get_or_create(
+            email=email,
+            defaults={
+                "first_name": first_name,
+                "last_name": last_name,
+                "is_active": True,
+            },
+        )
+
+        # Update name on every login in case it changed on Google
+        if not is_new:
+            if user.first_name != first_name or user.last_name != last_name:
+                user.first_name = first_name
+                user.last_name = last_name
+                user.save()
+
+        # ── Step 5: Fetch business and receipts (matches your login action) ──
+        business = Business.objects.filter(owner=user).first()
+        receipts_qs = Receipt.objects.filter(business=business).order_by('-updated_at')[:50] if business else []
+        receipts_data = ReceiptListSerializer(receipts_qs, many=True).data
+
+        # ── Step 6: Generate JWT tokens ──────────────────────────────────────
+        refresh = RefreshToken.for_user(user)
+        access_token = str(refresh.access_token)
+        refresh_token = str(refresh)
+
+        return Response({
+            "user": UserSerializer(user).data,
+            "business": BusinessSerializer(business).data if business else None,
+            "receipts": receipts_data,
+            "access": access_token,
+            "refresh": refresh_token,
+            "isNew": is_new,
+            "message": "Google login successful",
+        }, status=status.HTTP_200_OK)        

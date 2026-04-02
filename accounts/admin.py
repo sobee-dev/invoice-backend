@@ -1,30 +1,43 @@
 from django.contrib import admin
-
-from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from .models import User
 
+@admin.register(User)
 class CustomUserAdmin(UserAdmin):
-    # This determines which columns show up in the admin list view
-    list_display = ('email', 'is_staff', 'is_active', 'created_at')
     
-    # This tells the admin to use the email as the main identifier
-    ordering = ('email',)
-    
-    # This is required because we removed the 'username' field
+    def get_business(self, obj):
+        from business.models import Business
+        biz = Business.objects.filter(owner=obj).first()
+        return biz.name if biz else "—"
+
+    get_business.short_description = "Business"
+
+    list_display = ("email", "first_name", "last_name", "get_business", "is_staff", "is_active", "created_at")
+
+    list_filter = ("is_staff", "is_active", "created_at")
+    search_fields = ("email", "first_name", "last_name")
+    ordering = ("-created_at",)
+
     fieldsets = (
-        (None, {'fields': ('email', 'password')}),
-        ('Personal info', {'fields': ('first_name', 'last_name', 'default_currency')}),
-        ('Permissions', {'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
-        ('Important dates', {'fields': ('email_verified_at', 'last_login', 'date_joined')}),
+        ("Account", {"fields": ("email", "password")}),
+        ("Personal Info", {"fields": ("first_name", "last_name", "default_currency")}),
+        ("Permissions", {"fields": (
+            "is_active", "is_staff", "is_superuser",
+            "groups", "user_permissions"
+        )}),
+        ("Important Dates", {"fields": ("email_verified_at", "last_login", "date_joined")}),
     )
-    
-    # Required for creating users in the admin
+
     add_fieldsets = (
         (None, {
-            'classes': ('wide',),
-            'fields': ('email', 'password'),
+            "classes": ("wide",),
+            "fields": ("email", "password1", "password2", "is_staff", "is_active"),
         }),
     )
 
-admin.site.register(User, CustomUserAdmin)
+    readonly_fields = ("last_login", "date_joined", "email_verified_at", "created_at")
+
+    # Required since username field is removed
+    filter_horizontal = ("groups", "user_permissions")
+    
+    

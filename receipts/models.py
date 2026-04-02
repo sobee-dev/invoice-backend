@@ -39,7 +39,7 @@ class Template(models.Model):
 
 
 class Receipt(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=True)
     
     business = models.ForeignKey(
         'business.Business', 
@@ -99,7 +99,6 @@ class Receipt(models.Model):
     paid_at = models.DateTimeField(null=True, blank=True) # paidAt -> paid_at
     
     # Sync fields
-    server_id = models.IntegerField(null=True, blank=True, unique=True) # serverId -> server_id
     sync_status = models.CharField(
         max_length=20,
         choices=SyncStatus.choices,
@@ -118,7 +117,6 @@ class Receipt(models.Model):
             models.Index(fields=['business']),
             models.Index(fields=['receipt_number']),
             models.Index(fields=['sync_status']),
-            models.Index(fields=['server_id']),
             models.Index(fields=['-receipt_date']),
             models.Index(fields=['is_paid']),
         ]

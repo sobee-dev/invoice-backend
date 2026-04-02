@@ -13,26 +13,23 @@ class ReceiptItemSerializer(serializers.ModelSerializer):
 
 
 class ReceiptDetailSerializer(serializers.ModelSerializer):
-    items = ReceiptItemSerializer(many=True)
+    items = ReceiptItemSerializer(many=True, required=False)
+    id = serializers.UUIDField(required=False)
     
     class Meta:
         model = Receipt
         fields = '__all__'
-        read_only_fields = ['id', 'created_at', 'updated_at', 'server_id']
+        read_only_fields = ['created_at', 'updated_at', 'business']
         # Explicitly handling the unique constraint for the API
-        validators = [
-            UniqueTogetherValidator(
-                queryset=Receipt.objects.all(),
-                fields=['business', 'receipt_number'],
-                message="This receipt number already exists for this business."
-            )
-        ]
+        validators = [ ]
 
     def validate(self, data):
         """
         Cross-field validation to ensure financial integrity.
         """
         items = data.get('items', [])
+        if not items :
+            return data
         subtotal = data.get('subtotal', Decimal('0.00'))
         tax_rate = data.get('tax_rate', Decimal('0.00'))
         discount = data.get('discount', Decimal('0.00'))
@@ -61,7 +58,7 @@ class ReceiptDetailSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        items_data = validated_data.pop('items')
+        items_data = validated_data.pop('items',[])
         receipt = Receipt.objects.create(**validated_data)
         
         for item_data in items_data:
@@ -71,7 +68,7 @@ class ReceiptDetailSerializer(serializers.ModelSerializer):
         return receipt
 
     def update(self, instance, validated_data):
-        items_data = validated_data.pop('items', None)
+        items_data = validated_data.pop('items', [])
         
         for attr, value in validated_data.items():
             setattr(instance, attr, value)

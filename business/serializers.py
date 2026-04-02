@@ -35,10 +35,16 @@ class BusinessBaseSerializer(serializers.ModelSerializer):
         return value.lower() if value else value
 
     def validate_currency(self, value):
-        if value and len(value) != 3:
-            raise serializers.ValidationError("Currency code must be 3 characters (ISO 4217)")
-        return value.upper() if value else value
-
+    # 1. Check if it's empty
+        if not value:
+            raise serializers.ValidationError("Currency symbol must be provided")
+        
+        # 2. Check length (Symbols are usually 1-3 characters)
+        if len(value) > 5:
+            raise serializers.ValidationError("Currency symbol is too long")
+            
+        return value
+    
     def validate_logo_url(self, value):
         if not value:
             return value

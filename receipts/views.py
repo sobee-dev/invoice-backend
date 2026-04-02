@@ -59,56 +59,54 @@ class ReceiptViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], url_path='bulk-sync')
     def bulk_sync(self, request):
-        """
-        POST /api/receipts/bulk-sync/
-        Used by the frontend to upload multiple receipts created while offline.
-        """
-        receipts_data = request.data  # Expecting a list of receipt objects
+        receipts_data = request.data
+
         if not isinstance(receipts_data, list):
-            return Response({"error": "Expected a list of receipts"}, 
+            return Response(
+                {"error": "Expected a list of receipts"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        results = {"created": 0,"updated": 0,"errors": [] }
+        user_business = Business.objects.filter(owner=request.user).first()
+        if not user_business:
+            return Response(
+                {"error": "No business found for user"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        synced_ids = []
+        errors = []
 
         for data in receipts_data:
-            items_data = data.pop('items', [])
-            receipt_id = data.get('id')
+            receipt_id = data.get('id')  # Frontend UUID — now the real PK
+
             try:
-                # Check if receipt already exists (it might have been partially synced)
-                instance = Receipt.objects.filter(id=receipt_id).first()
-                
+                # Single, correct lookup by UUID
+                instance = Receipt.objects.filter(id=receipt_id, business=user_business).first()
+
                 if instance:
                     serializer = ReceiptDetailSerializer(instance, data=data, partial=True)
                 else:
-                    # CREATE new (using the client-side UUID)
                     serializer = ReceiptDetailSerializer(data=data)
-                
-                if serializer.is_valid():
-                    user_business = Business.objects.filter(owner=request.user).first()
-                    with transaction.atomic():
-                        receipt = serializer.save(sync_status=SyncStatus.SYNCED, business=user_business)
-                        
-                        # Handle Nested Items: Clear and Re-add to avoid duplicates
-                        receipt.items.all().delete() 
-                        for item in items_data:
-                            # Assuming you have a related_name='items' on your ReceiptItem model
-                            receipt.items.create(
-                                description=item.get('description'),
-                                quantity=item.get('quantity'),
-                                unitPrice=item.get('unitPrice'),
-                                total=item.get('total')
-                            )
-                        
-                        if instance: results["updated"] += 1 
-                        else: results["created"] += 1
-                else:
-                    results["errors"].append({"id": receipt_id, "errors": serializer.errors})
-                    
-            except Exception as e:
-                results["errors"].append({"id": receipt_id, "error": str(e)})
 
-        return Response(results, status=status.HTTP_200_OK)
+                if serializer.is_valid():
+                    with transaction.atomic():
+                        receipt = serializer.save(
+                            sync_status=SyncStatus.SYNCED,
+                            business=user_business
+                        )
+                        synced_ids.append(str(receipt.id))  # ← string, not UUID object
+                else:
+                    errors.append({"id": receipt_id, "errors": serializer.errors})
+
+            except Exception as e:
+                errors.append({"id": receipt_id, "error": str(e)})
+
+        return Response({
+            "synced_ids": synced_ids,
+            "errors": errors
+        }, status=status.HTTP_200_OK)
+        
 
     @action(detail=True, methods=['post'], url_path='soft-delete')
     def soft_delete_receipt(self, request, pk=None):
