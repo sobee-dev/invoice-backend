@@ -24,7 +24,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ── Frontend URL (drives CORS, CSRF, Google redirect) ─────────────────────────
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
+BACKEND_URL = os.getenv("BACKEND_URL")
 # ── Database ──────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -110,7 +110,7 @@ TEMPLATES = [
 # ── CORS & CSRF ───────────────────────────────────────────────────────────────
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [FRONTEND_URL]
-CSRF_TRUSTED_ORIGINS = [FRONTEND_URL]
+CSRF_TRUSTED_ORIGINS = [BACKEND_URL]
 CSRF_COOKIE_HTTPONLY = False  # Must be False so Axios can read it
 CSRF_USE_SESSIONS = False
 
