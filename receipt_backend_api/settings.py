@@ -115,6 +115,8 @@ CSRF_TRUSTED_ORIGINS = [BACKEND_URL]
 CSRF_COOKIE_HTTPONLY = False  # Must be False so Axios can read it
 CSRF_USE_SESSIONS = False
 
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+
 CORS_ALLOW_HEADERS = [
     "content-type",
     "authorization",
@@ -226,3 +228,5 @@ if IS_PROD:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     X_FRAME_OPTIONS = "DENY"
+    
+    
