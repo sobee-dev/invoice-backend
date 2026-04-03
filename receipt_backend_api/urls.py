@@ -3,6 +3,7 @@ from django.urls import include, path
 from dj_rest_auth.registration.views import SocialLoginView
 from allauth.socialaccount.providers.google.views import GoogleOAuth2Adapter
 from accounts.views import GoogleCallbackView
+from .views import health_check
 
 class GoogleLogin(SocialLoginView):
     adapter_class = GoogleOAuth2Adapter
@@ -10,6 +11,7 @@ class GoogleLogin(SocialLoginView):
 urlpatterns = [
    path('admin/', admin.site.urls), 
    path('api-auth/', include('rest_framework.urls')),
+   path('health/', health_check, name='health_check'),
    
     # API endpoints
    path('api/auth/google/', GoogleLogin.as_view(), name='google_login'),
