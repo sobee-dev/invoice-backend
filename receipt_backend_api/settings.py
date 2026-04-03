@@ -83,6 +83,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",       # must be first
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -219,7 +220,8 @@ USE_TZ = True
 
 # ── Static Files ──────────────────────────────────────────────────────────────
 STATIC_URL = "static/"
-
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 # ── Production Security ───────────────────────────────────────────────────────
 if IS_PROD:
     SECURE_SSL_REDIRECT = True
