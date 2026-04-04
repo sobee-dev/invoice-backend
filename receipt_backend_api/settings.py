@@ -47,11 +47,8 @@ else:
 
 # ── Installed Apps ────────────────────────────────────────────────────────────
 INSTALLED_APPS = [
-    # Cloudinary must be before staticfiles
-    "cloudinary_storage",
-    "cloudinary",
-
-    # Django core
+    
+     # Django core
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -59,6 +56,17 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "django.contrib.sites",
+    
+    # Whitenoise
+    "whitenoise.runserver_nostatic",
+    
+    
+    # Cloudinary 
+    
+    "cloudinary_storage",
+    "cloudinary",
+
+   
 
     # Third party
     "rest_framework",
@@ -74,7 +82,6 @@ INSTALLED_APPS = [
 
     # Local apps
     "accounts",
-    "pages",
     "receipts",
     "business",
 ]
@@ -116,7 +123,6 @@ CSRF_TRUSTED_ORIGINS = [BACKEND_URL]
 CSRF_COOKIE_HTTPONLY = False  # Must be False so Axios can read it
 CSRF_USE_SESSIONS = False
 
-ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
 CORS_ALLOW_HEADERS = [
     "content-type",
@@ -201,6 +207,7 @@ CLOUDINARY_STORAGE = {
     "CLOUD_NAME": os.getenv("CLOUDINARY_CLOUD_NAME"),
     "API_KEY": os.getenv("CLOUDINARY_API_KEY"),
     "API_SECRET": os.getenv("CLOUDINARY_API_SECRET"),
+    # "STATICFILES_STORAGE": None,
 }
 DEFAULT_FILE_STORAGE = "cloudinary_storage.storage.MediaCloudinaryStorage"
 
@@ -222,6 +229,10 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+
+
+
 # ── Production Security ───────────────────────────────────────────────────────
 if IS_PROD:
     SECURE_SSL_REDIRECT = True
