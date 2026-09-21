@@ -1,0 +1,13 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<h1>Set {{ accounts.count }} account(s) → {{ label }}</h1>
+<ul>
+  {% for a in accounts %}<li>{{ a.email }} (currently: {{ a.status }})</li>{% endfor %}
+</ul>
+<form method="post">
+  {% csrf_token %}
+  {{ form }}
+  <input type="hidden" name="action" value="{{ action_name }}">
+  <input type="submit" name="apply" value="Confirm">
+</form>
+{% endblock %}

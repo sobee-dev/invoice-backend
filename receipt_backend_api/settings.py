@@ -50,6 +50,7 @@ else:
             "NAME": BASE_DIR / "db.sqlite3",
         }
     }
+    
 
 # ── Installed Apps ────────────────────────────────────────────────────────────
 INSTALLED_APPS = [
@@ -81,7 +82,7 @@ INSTALLED_APPS = [
 
     # Local apps
     "accounts",
-    "receipts",
+    
     "business",
     "products",
     "customers",
@@ -89,11 +90,14 @@ INSTALLED_APPS = [
     "inventory",
     "reports",
     "staff",
-    "push",
+    "notifications",
     "billing",
 ]
 
 
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "BillBuzz <noreply@yourdomain.com>")
 
 
 STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
@@ -172,10 +176,17 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ],
+    
     "DEFAULT_THROTTLE_RATES": {
-        "anon": "100/day",
-        "user": "1000/day",
+        "anon": "60/hour" if IS_PROD else "10000/day",
+        "user": "5000/day" if IS_PROD else "100000/day",
+        "password_reset": "5/hour",
     },
+    
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+        'accounts.permissions.BusinessActivePermission',
+    ],
 }
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
@@ -218,7 +229,8 @@ SOCIALACCOUNT_PROVIDERS = {
     }
 }
 
-GOOGLE_REDIRECT_URI = f"{FRONTEND_URL}/oauth/callback"
+# settings.py
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", f"{FRONTEND_URL}/oauth/callback")
 GOOGLE_MOBILE_REDIRECT_URI = os.getenv("GOOGLE_MOBILE_REDIRECT_URI", "billbuzz://")
 GOOGLE_EXPO_PROXY_REDIRECT_URI = os.getenv("GOOGLE_EXPO_PROXY_REDIRECT_URI")  # only needed while testing in Expo Go
 

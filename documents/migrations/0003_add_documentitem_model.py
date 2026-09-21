@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('documents', '0002_copy_receipts_to_documents'),
+        ('documents', '0001_create_document_model'),
         ('products', '0001_create_product_model'),
     ]
 

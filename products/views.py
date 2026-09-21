@@ -10,6 +10,7 @@ from business.utils import get_user_business
 from documents.models import Document, DocumentItem
 from .models import Product
 from .serializers import BulkDeductSerializer, ProductSerializer, ProductListSerializer, ProductUpdateSerializer, StockAdjustmentSerializer
+from .services import check_and_notify_stock_level
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from inventory.models import InventoryTransaction
 import re
@@ -218,6 +219,8 @@ class ProductViewSet(viewsets.ModelViewSet):
             reason=reason,
         )
 
+        check_and_notify_stock_level(product)
+
         return Response(
             {
                 'status': 'Stock adjusted.',
@@ -302,10 +305,13 @@ class ProductViewSet(viewsets.ModelViewSet):
                 initiated_by=request.user,
                 reason=item.get('reason', ''),
             )
+
+            check_and_notify_stock_level(product)
+
             results.append({
                 'product_id': str(product.id),
                 'transaction_id': str(tx.id),
                 'new_quantity': str(product.quantity_on_hand),
             })
 
-        return Response({'status': 'Stock deducted.', 'results': results}, status=status.HTTP_200_OK)    
+        return Response({'status': 'Stock deducted.', 'results': results}, status=status.HTTP_200_OK)

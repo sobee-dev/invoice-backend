@@ -5,7 +5,7 @@ from django.utils import timezone
 
 from business.serializers import BusinessSerializer
 from business.utils import get_user_business
-from .models import User
+from .models import AccountStatus, AccountStatusAudit, PasswordResetToken, User
 
 
 # ============================================
@@ -291,4 +291,123 @@ class UserWithBusinessSerializer(UserSerializer):
         biz = get_user_business(obj)
         # if hasattr(obj, 'business'):
         return BusinessSerializer(biz).data if biz else None
-       
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    # No validate_email uniqueness check here — deliberately. See view below:
+    # this serializer must never reveal whether an email exists.
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, min_length=6)
+    new_password_confirm = serializers.CharField(write_only=True, min_length=6)
+
+    def validate(self, attrs):
+        if attrs['new_password'] != attrs['new_password_confirm']:
+            raise serializers.ValidationError(
+                {"new_password_confirm": "Passwords do not match."}
+            )
+        try:
+            validate_password(attrs['new_password'])
+        except serializers.ValidationError as e:
+            raise serializers.ValidationError({"new_password": e.messages})
+
+        record = PasswordResetToken.verify(attrs['token'])
+        if record is None:
+            raise serializers.ValidationError(
+                {"token": "This reset link is invalid or has expired."}
+            )
+        self.token_record = record
+        return attrs
+
+    def save(self):
+        user = self.token_record.user
+        user.set_password(self.validated_data['new_password'])
+        user.requires_password_change = False
+        user.password_changed_at = timezone.now()
+        user.save()
+
+        self.token_record.used_at = timezone.now()
+        self.token_record.save(update_fields=['used_at'])
+
+        # Kill any existing sessions — a password reset should log out
+        # every device that was logged in with the old password.
+        from rest_framework_simplejwt.token_blacklist.models import OutstandingToken, BlacklistedToken
+        for outstanding in OutstandingToken.objects.filter(user=user):
+            BlacklistedToken.objects.get_or_create(token=outstanding)
+
+        return user    
+    
+class AccountDeletionRequestSerializer(serializers.Serializer):
+    """Owner-initiated deletion — requires password re-entry, reason optional."""
+    password = serializers.CharField(write_only=True)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+
+    def validate_password(self, value):
+        user = self.context['request'].user
+        if not user.check_password(value):
+            raise serializers.ValidationError("Incorrect password.")
+        return value
+
+    def save(self):
+        from .models import AccountStatus
+        from .services import set_account_status
+        return set_account_status(
+            user=self.context['request'].user,
+            new_status=AccountStatus.PENDING_DELETION,
+            reason=self.validated_data.get('reason', ''),
+        )
+
+
+class AdminAccountStatusSerializer(serializers.Serializer):
+    """Used by UserViewSet.set_status — the API the admin dashboard calls."""
+    status = serializers.ChoiceField(choices=AccountStatus.choices)
+    reason = serializers.CharField(max_length=1000)  # required — no silent status changes
+
+
+class AccountStatusAuditSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AccountStatusAudit
+        fields = ['id', 'user_id', 'email', 'from_status', 'to_status', 'reason', 'actor_email', 'created_at']
+        read_only_fields = fields    
+    
+class CancelAccountDeletionSerializer(serializers.Serializer):
+    """
+    Self-service reactivation for an account still inside its grace period.
+    Deliberately doesn't use Django's authenticate(): ModelBackend refuses
+    inactive users outright, and a pending-deletion account is inactive by
+    design — so the password is checked directly against the looked-up user.
+    """
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        from django.utils import timezone
+        from .models import AccountStatus
+
+        email = attrs['email'].lower()
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({'error': 'Invalid email or password.'})
+
+        if not user.check_password(attrs['password']):
+            raise serializers.ValidationError({'error': 'Invalid email or password.'})
+
+        if user.status != AccountStatus.PENDING_DELETION:
+            raise serializers.ValidationError({'error': 'This account is not scheduled for deletion.'})
+
+        if user.deletion_scheduled_for and user.deletion_scheduled_for <= timezone.now():
+            raise serializers.ValidationError({'error': 'The deletion grace period has already ended.'})
+
+        self.user = user
+        return attrs
+
+    def save(self):
+        from .models import AccountStatus
+        from .services import set_account_status
+        return set_account_status(
+            user=self.user, new_status=AccountStatus.ACTIVE,
+            reason='Self-service reactivation before grace period ended.',
+        )       

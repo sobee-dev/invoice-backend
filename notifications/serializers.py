@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import PushToken
+from .models import PushToken, Notification
 
 
 class RegisterTokenSerializer(serializers.Serializer):
@@ -43,3 +43,15 @@ class UnregisterTokenSerializer(serializers.Serializer):
         user = self.context['request'].user
         token = self.validated_data['expo_push_token']
         PushToken.objects.filter(token=token, user=user).delete()
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    is_read = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'notification_type', 'title', 'body', 'data',
+            'is_read', 'read_at', 'created_at',
+        ]
+        read_only_fields = fields

@@ -66,20 +66,15 @@ class CustomerViewSet(viewsets.ModelViewSet):
         customer = self.get_object()
         customer.status = 'inactive'
         customer.save(update_fields=['status'])
-        return Response(
-            {'status': 'Customer deactivated', 'id': str(customer.id)},
-            status=status.HTTP_200_OK
-        )
+        return Response(CustomerSerializer(customer).data, status=status.HTTP_200_OK)
+
 
     @action(detail=True, methods=['post'], url_path='reactivate')
     def reactivate(self, request, pk=None):
         customer = self.get_object()
         customer.status = 'active'
         customer.save(update_fields=['status'])
-        return Response(
-            {'status': 'Customer reactivated', 'id': str(customer.id)},
-            status=status.HTTP_200_OK
-        )
+        return Response(CustomerSerializer(customer).data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='analytics')
     def analytics(self, request):

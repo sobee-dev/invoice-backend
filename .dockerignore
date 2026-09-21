@@ -1,0 +1,15 @@
+# ── .dockerignore ────────────────────────────────────────────────────────
+# Same idea as .gitignore, but for Docker. When the Dockerfile does
+# "COPY . .", this file tells it what to SKIP — so junk, secrets, and
+# local-only files don't get baked into the image.
+
+.env
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.sqlite3
+.DS_Store

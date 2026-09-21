@@ -1,6 +1,25 @@
 from rest_framework import serializers
+
+from receipt_backend_api import settings
 from .models import Product
 from decimal import Decimal
+
+
+
+def validate_cloudinary_image_url(value):
+    """
+    Shared with business/serializers.py's validate_logo_url — same rule,
+    same reason: purge_account() calls delete_cloudinary_asset() on this
+    field, so anything that isn't actually hosted on our Cloudinary account
+    would either fail silently or, worse, attempt to "delete" a URL we
+    don't own.
+    """
+    if not value:
+        return value
+    cloud_name = settings.CLOUDINARY_STORAGE["CLOUD_NAME"]
+    if f"res.cloudinary.com/{cloud_name}/" not in value:
+        raise serializers.ValidationError("Product image must be uploaded via Cloudinary")
+    return value
 
 class ProductSerializer(serializers.ModelSerializer):
     available_to_sell = serializers.DecimalField(
@@ -8,6 +27,7 @@ class ProductSerializer(serializers.ModelSerializer):
     )
     is_low_stock = serializers.BooleanField(read_only=True)
     total_sold = serializers.DecimalField(max_digits=10, decimal_places=3, read_only=True)
+    
     class Meta:
         model = Product
         fields = [
@@ -19,6 +39,8 @@ class ProductSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id','total_sold', 'business', 'created_at', 'updated_at']
 
+    def validate_image_url(self, value):
+        return validate_cloudinary_image_url(value)
 
 class ProductUpdateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -27,6 +49,9 @@ class ProductUpdateSerializer(serializers.ModelSerializer):
             'name', 'description', 'sku', 'unit_price',
             'image_url', 'reorder_level', 'is_active'
         ]
+        
+    def validate_image_url(self, value):
+        return validate_cloudinary_image_url(value)    
 
     def validate_sku(self, value):
         if not value:

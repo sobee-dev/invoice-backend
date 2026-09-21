@@ -1,6 +1,8 @@
 
 
 # accounts/views.py
+
+from django.views.generic import TemplateView
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,16 +14,22 @@ import os
 import requests
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
-
+from django.db import transaction
+from accounts.email import send_onboarding_email, send_password_reset_email
 from business.models import Business
 from business.serializers import BusinessSerializer
 from business.utils import get_user_business
-from receipts.models import Receipt
-from receipts.serializers import ReceiptListSerializer
-from django.conf import settings
 
-from .models import User
+from django.conf import settings
+from .services import set_account_status
+from .models import AccountStatus, AccountStatusAudit, PasswordResetToken, User
 from .serializers import (
+    AccountDeletionRequestSerializer,
+    AccountStatusAuditSerializer,
+    AdminAccountStatusSerializer,
+    CancelAccountDeletionSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
     UserSerializer,
     UserRegistrationSerializer,
     UserUpdateSerializer,
@@ -36,6 +44,10 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .token import SessionLimitedTokenRefreshSerializer
 from django.http import HttpResponse
 from django.views.decorators.http import require_GET
+
+
+
+
 class UserViewSet(viewsets.ModelViewSet):
     """
     ViewSet for User model handling Authentication and Profile management.
@@ -57,12 +69,21 @@ class UserViewSet(viewsets.ModelViewSet):
             return ChangePasswordSerializer
         elif self.action == 'admin_dashboard_stats':
             return AdminDashboardSerializer
-        
+        elif self.action == 'request_password_reset':
+            return PasswordResetRequestSerializer
+        elif self.action == 'confirm_password_reset':
+            return PasswordResetConfirmSerializer
+        elif self.action == 'request_account_deletion':
+            return AccountDeletionRequestSerializer
+        elif self.action == 'set_status':
+            return AdminAccountStatusSerializer
+        elif self.action == 'cancel_account_deletion':
+            return CancelAccountDeletionSerializer
         return UserSerializer
         
     def get_permissions(self):
         """Set permissions based on action"""
-        if self.action in ['register', 'login']:
+        if self.action in ['register', 'login', 'request_password_reset', 'confirm_password_reset', 'cancel_account_deletion']:
             return [permissions.AllowAny()]
         return [permissions.IsAuthenticated()]
     
@@ -87,6 +108,8 @@ class UserViewSet(viewsets.ModelViewSet):
         
         refresh = RefreshToken.for_user(user)
         refresh['orig_iat'] = int(timezone.now().timestamp())
+        
+        transaction.on_commit(lambda: send_onboarding_email(user))
         
         response = Response({
             'user': UserSerializer(user).data,
@@ -115,7 +138,7 @@ class UserViewSet(viewsets.ModelViewSet):
           - user data
           - requires_password_change flag ← KEY FOR STAFF PASSWORD CHANGE
           - business data (if owner)
-          - recent receipts (if owner)
+          
         """
         email = request.data.get('email')
         password = request.data.get('password')
@@ -140,11 +163,30 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
-        if not user.is_active:
+        if user.status == AccountStatus.SUSPENDED:
             return Response(
-                {'error': 'Account is disabled.'},
-                status=status.HTTP_403_FORBIDDEN
+                {'error': 'This account has been suspended. Contact support.', 'code': 'suspended'},
+                status=status.HTTP_403_FORBIDDEN,
             )
+        if user.status == AccountStatus.PENDING_DELETION:
+            return Response(
+                {
+                    'error': 'This account is scheduled for deletion.',
+                    'code': 'pending_deletion',
+                    'deletionScheduledFor': user.deletion_scheduled_for,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if not user.is_active:
+            return Response({'error': 'Account is disabled.', 'code': 'disabled'}, status=status.HTTP_403_FORBIDDEN)
+        
+        if user.role == 'staff':
+            business = get_user_business(user)
+            if business and business.owner.status == AccountStatus.SUSPENDED:
+                return Response(
+                    {'error': 'This business account has been suspended. Contact the business owner or support.', 'code': 'business_suspended'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
         
         # Generate tokens
         refresh = RefreshToken.for_user(user)
@@ -152,18 +194,14 @@ class UserViewSet(viewsets.ModelViewSet):
         access_token = str(refresh.access_token)
         refresh_token = str(refresh)
         
-        # Get business and receipts (for owners)
+        # Get business and docs (for owners)
         business = get_user_business(user)
-        receipts_qs = Receipt.objects.filter(
-            business=business
-        ).order_by('-updated_at')[:50] if business else []
-        receipts_data = ReceiptListSerializer(receipts_qs, many=True).data
+        
         
         # Prepare response
         response = Response({
             'user': UserSerializer(user).data,
             'business': BusinessSerializer(business).data if business else None,
-            'receipts': receipts_data,
             'access': access_token,
             'refresh': refresh_token,
             'requires_password_change': user.requires_password_change,  # ← KEY FLAG
@@ -206,6 +244,78 @@ class UserViewSet(viewsets.ModelViewSet):
             'message': 'Email verified successfully',
             'email_verified_at': user.email_verified_at
         }, status=status.HTTP_200_OK)
+
+
+    @action(detail=False, methods=['post'], url_path='password_reset/request')
+    def request_password_reset(self, request):
+        """
+        POST /api/users/password_reset/request/
+        Always returns 200 with the same message — never reveal whether
+        the email exists, or attackers can enumerate registered accounts.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data['email'].lower()
+
+        user = User.objects.filter(email=email, is_active=True).first()
+        if user:
+            raw_token = PasswordResetToken.issue(user)
+            reset_url = f"{settings.BACKEND_URL}/reset-password/?token={raw_token}"
+            send_password_reset_email(user, reset_url)
+
+        return Response({
+            "message": "If an account exists for that email, a reset link has been sent."
+        })
+
+    @action(detail=False, methods=['post'], url_path='password_reset/confirm')
+    def confirm_password_reset(self, request):
+        """POST /api/users/password_reset/confirm/"""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({"message": "Password reset successfully. Please log in."})
+    
+    
+        # ========== SELF-SERVICE: REQUEST DELETION ==========
+    @action(detail=False, methods=['post'])
+    def request_account_deletion(self, request):
+        """
+        POST /api/users/request_account_deletion/
+        Body: {"password": "...", "reason": "..."}  (reason optional)
+        """
+        serializer = self.get_serializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response({
+            'message': 'Account scheduled for deletion.',
+            'deletionScheduledFor': user.deletion_scheduled_for,
+        })
+
+    # ========== ADMIN: SUSPEND / SCHEDULE DELETION / RESTORE ==========
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAdminUser])
+    def set_status(self, request, pk=None):
+        """
+        POST /api/users/{id}/set_status/
+        Body: {"status": "suspended" | "pending_deletion" | "active", "reason": "..."}
+        Backs the admin dashboard's status control. Reason is mandatory here —
+        this is an operator overriding someone's account, it always needs a paper trail.
+        """
+        target_user = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        updated = set_account_status(
+            user=target_user,
+            new_status=serializer.validated_data['status'],
+            reason=serializer.validated_data['reason'],
+            actor=request.user,
+        )
+        return Response(UserSerializer(updated).data)
+
+    @action(detail=True, methods=['get'], permission_classes=[permissions.IsAdminUser])
+    def status_audit(self, request, pk=None):
+        """GET /api/users/{id}/status_audit/ — the account's status history."""
+        rows = AccountStatusAudit.objects.filter(user_id=pk)
+        return Response(AccountStatusAuditSerializer(rows, many=True).data)
 
     # ========== UPDATE NOTIFICATIONS ==========
     @action(detail=False, methods=['patch'])
@@ -267,10 +377,34 @@ class UserViewSet(viewsets.ModelViewSet):
         }   
         serializer = self.get_serializer(stats_data)
         return Response(serializer.data)
+    
+    
+    @action(detail=False, methods=['post'])
+    def cancel_account_deletion(self, request):
+        """
+        POST /api/users/cancel_account_deletion/
+        AllowAny — the account is deactivated, so the user can't reach this
+        through the normal authenticated flow. Logs them straight back in
+        on success so they don't need a second round trip.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
 
+        refresh = RefreshToken.for_user(user)
+        refresh['orig_iat'] = int(timezone.now().timestamp())
 
+        return Response({
+            'message': 'Account reactivated.',
+            'user': UserSerializer(user).data,
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
+        })    
 
-# accounts/views.py
+# ============================================
+# OAUTH MOBILE BRIDGE — standalone function view, not a ViewSet action
+# ============================================
+
 @require_GET
 def oauth_mobile_bridge(request):
     code = request.GET.get('code', '')
@@ -286,8 +420,8 @@ def oauth_mobile_bridge(request):
     html = f"""<!DOCTYPE html>
     <html><head><meta http-equiv="refresh" content="0;url={deep_link}"></head>
     <body>
-      <p>Redirecting back to the app…</p>
-      <script>window.location.replace("{deep_link}");</script>
+    <p>Redirecting back to the app…</p>
+    <script>window.location.replace("{deep_link}");</script>
     </body></html>"""
     return HttpResponse(html)
 
@@ -389,13 +523,9 @@ class GoogleCallbackView(APIView):
                 user.last_name = last_name
                 user.save()
 
-        # ── Step 5: Fetch business and receipts ──────────────────────────────
+        # ── Step 5: Fetch business and docs ──────────────────────────────
         business = Business.objects.filter(owner=user).first()
-        receipts_qs = Receipt.objects.filter(
-            business=business
-        ).order_by('-updated_at')[:50] if business else []
-        receipts_data = ReceiptListSerializer(receipts_qs, many=True).data
-
+        
         # ── Step 6: Generate JWT tokens ──────────────────────────────────────
         refresh = RefreshToken.for_user(user)
         refresh['orig_iat'] = int(timezone.now().timestamp())
@@ -405,7 +535,7 @@ class GoogleCallbackView(APIView):
         return Response({
             "user": UserSerializer(user).data,
             "business": BusinessSerializer(business).data if business else None,
-            "receipts": receipts_data,
+           
             "access": access_token,
             "refresh": refresh_token,
             "requires_password_change": user.requires_password_change,  # ← KEY FLAG
@@ -413,7 +543,9 @@ class GoogleCallbackView(APIView):
             "message": "Google login successful",
         }, status=status.HTTP_200_OK)
         
-        
+class PasswordResetPageView(TemplateView):
+    template_name = "accounts/reset_password.html"
+            
 class SessionLimitedTokenRefreshView(TokenRefreshView):
     serializer_class = SessionLimitedTokenRefreshSerializer
         

@@ -31,10 +31,11 @@ class DocumentItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DocumentItem
-        fields = ['id', 'product', 'product_name', 'description', 'quantity', 'unit_price']
+        fields = ['id', 'product', 'product_name', 'description', 'quantity', 'unit_price', 'total']
         extra_kwargs = {
             'product': {'required': False},
             'id': {'read_only': True},
+            'total': {'read_only': True},
         }
     def validate(self, attrs):
         if not attrs.get('product') and not attrs.get('product_name'):
@@ -94,7 +95,7 @@ class DocumentListSerializer(serializers.ModelSerializer):
             'id', 'document_type', 'status', 'document_number', 'document_date',
             'customer_name', 'supplier_name', 'currency',
             'grand_total', 'amount_paid',
-            'is_delivered', 'created_by',
+            'is_delivered', 'created_by', 'created_at' ,
         ]
 
 

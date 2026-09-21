@@ -18,13 +18,13 @@ urlpatterns = [
    path('api/auth/google/callback/', GoogleCallbackView.as_view(), name='google_callback'),  # ← add this
    path('api/users/', include('accounts.urls')),
    path('api/business/', include('business.urls')),
-   path('api/receipts/', include('receipts.urls')),
    path('api/products/', include('products.urls')),
    path('api/customers/', include('customers.urls')),
    path('api/documents/', include('documents.urls')),
    path('api/inventory/', include('inventory.urls')),
    path('api/staff/', include('staff.urls')),
    path('api/reports/', include('reports.urls')),
+   path('api/notifications/', include('notifications.urls')),
 #    path('api/billing/', include('billing.urls')),
 #    path('billing/', include('billing.web_urls')),
 ]

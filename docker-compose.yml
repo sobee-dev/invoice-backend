@@ -1,0 +1,44 @@
+# ── docker-compose.yml ──────────────────────────────────────────────────────
+# The Dockerfile is the recipe. This file is the "meal plan" — it says
+# HOW to run the container built from that recipe: which port to open,
+# what settings to hand it, whether it should restart itself, etc.
+#
+# Right now you only have one thing to run (the Django app), so this
+# file has one "service". Later, when you add Redis, it becomes a
+# second service in this same file, sitting right next to "web".
+
+services:
+
+  web:
+    # Build the image using the Dockerfile sitting in this same folder.
+    build: .
+
+    # Give the container a friendly name so `docker ps` and logs are
+    # easy to read instead of a random string.
+    container_name: billbuzz-backend
+
+    # Map port 8000 on the VPS itself to port 8000 inside the container.
+    # Format is "outside:inside". Nginx (on the VPS) will talk to
+    # localhost:8000 to reach this app.
+    ports:
+      - "8000:8000"
+
+    # Load secret values (database URL, secret key, etc.) from a
+    # separate file called .env, instead of writing them directly in
+    # this file. Keeps secrets out of anything you might commit to git.
+    env_file:
+      - .env
+
+    # If the container crashes, or the VPS reboots, Docker will
+    # automatically start it back up. "unless-stopped" means: always
+    # restart it, UNLESS you manually stopped it yourself on purpose.
+    restart: unless-stopped
+
+  # ── Add this later, once you actually need caching or background jobs ──
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: billbuzz-redis
+  #   restart: unless-stopped
+  #   # No "ports" needed here — only your "web" service needs to reach
+  #   # it, and Docker lets containers in the same compose file talk to
+  #   # each other by service name automatically (redis://redis:6379).

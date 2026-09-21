@@ -1,5 +1,5 @@
 from django.contrib import admin
-from django.db.models import Count, Sum
+from django.db.models import Count, Sum, Q
 from django.utils.html import format_html
 from .models import Business
 
@@ -9,10 +9,10 @@ class BusinessAdmin(admin.ModelAdmin):
 
     # ── Custom computed columns ──────────────────────────────────────────────
 
-    def receipt_count(self, obj):
-        return obj.receipt_count
-    receipt_count.short_description = "Receipts Issued"
-    receipt_count.admin_order_field = "receipt_count"  # makes column sortable
+    def document_count(self, obj):
+        return obj.document_count
+    document_count.short_description = "Documents Issued"
+    document_count.admin_order_field = "document_count"
 
     def total_revenue(self, obj):
         total = obj.total_revenue or 0
@@ -33,14 +33,14 @@ class BusinessAdmin(admin.ModelAdmin):
 
     list_display = [
         "name", "owner", "email", "phone",
-        "receipt_count", "total_revenue",
+        "document_count", "total_revenue",
         "onboarding_complete", "created_at",
     ]
     list_filter = ["onboarding_complete", "tax_enabled", "created_at", "currency"]
     search_fields = ["name", "owner__email", "email", "phone"]
     ordering = ["-created_at"]
     raw_id_fields = ["owner"]
-    readonly_fields = ["created_at", "updated_at", "logo_preview", "receipt_count", "total_revenue"]
+    readonly_fields = ["created_at", "updated_at", "logo_preview", "document_count", "total_revenue"]
 
     # ── Detail/edit page ─────────────────────────────────────────────────────
 
@@ -63,7 +63,7 @@ class BusinessAdmin(admin.ModelAdmin):
             "currency", "tax_rate", "tax_enabled",
         )}),
         ("Stats", {"fields": (
-            "receipt_count", "total_revenue",
+            "document_count", "total_revenue",
         )}),
         ("Status", {"fields": (
             "onboarding_complete", "sync_status", "server_id",
@@ -73,12 +73,13 @@ class BusinessAdmin(admin.ModelAdmin):
         )}),
     )
 
-    # ── Annotate queryset so receipt_count and total_revenue are sortable ────
+    # ── Annotate queryset so document_count and total_revenue are sortable ───
 
     def get_queryset(self, request):
         return super().get_queryset(request).annotate(
-            receipt_count=Count("receipts"),
-            total_revenue=Sum("receipts__grand_total"),
+            document_count=Count("documents"),
+            total_revenue=Sum(
+                "documents__grand_total",
+                filter=Q(documents__status__in=["paid",]),
+            ),
         )
-
-
