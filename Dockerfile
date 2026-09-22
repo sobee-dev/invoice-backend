@@ -43,10 +43,10 @@ COPY . .
 #    doesn't actually open the port by itself (docker-compose does that).
 EXPOSE 8000
 
-# 9. The command that actually starts the app when a container is run
-#    from this image. Gunicorn is a production-grade way to run Django
-#    (Django's own `runserver` is for local development only).
-#
-#    "receipt_backend_api.wsgi:application" points at the wsgi.py file
-#    inside your receipt_backend_api/ settings folder.
-CMD ["gunicorn", "receipt_backend_api.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
+# 9. Copy in the entrypoint script and make it executable. This runs
+#    `migrate` automatically, then starts gunicorn — see entrypoint.sh
+#    for exactly what it does and why.
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
