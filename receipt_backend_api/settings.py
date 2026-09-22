@@ -142,8 +142,8 @@ TEMPLATES = [
 
 # ── CORS & CSRF ───────────────────────────────────────────────────────────────
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOWED_ORIGINS = [FRONTEND_URL, MOBILE_URL]
-CSRF_TRUSTED_ORIGINS = [BACKEND_URL]
+CORS_ALLOWED_ORIGINS = [u for u in [FRONTEND_URL, MOBILE_URL] if u]
+CSRF_TRUSTED_ORIGINS = [u.strip() for u in os.getenv("BACKEND_URL", "").split(",") if u.strip()]
 CSRF_COOKIE_HTTPONLY = False  # Must be False so Axios can read it
 CSRF_USE_SESSIONS = False
 
