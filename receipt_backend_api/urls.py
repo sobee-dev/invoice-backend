@@ -9,7 +9,7 @@ class GoogleLogin(SocialLoginView):
     adapter_class = GoogleOAuth2Adapter
 
 urlpatterns = [
-   path('admin/', admin.site.urls), 
+   path('jagaban/', admin.site.urls), 
    path('api-auth/', include('rest_framework.urls')),
    path('health/', health_check, name='health_check'),
    
@@ -25,6 +25,6 @@ urlpatterns = [
    path('api/staff/', include('staff.urls')),
    path('api/reports/', include('reports.urls')),
    path('api/notifications/', include('notifications.urls')),
-#    path('api/billing/', include('billing.urls')),
-#    path('billing/', include('billing.web_urls')),
+   path('api/billing/', include('billing.urls')),
+   path('billing/', include('billing.web_urls')),
 ]

@@ -1,138 +1,208 @@
 # billing/services.py
+import hmac
+import hashlib
 import logging
-import stripe
+import requests
 from django.conf import settings
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
 
 from .models import Subscription
 
-stripe.api_key = settings.STRIPE_SECRET_KEY
 logger = logging.getLogger(__name__)
+PAYSTACK_BASE_URL = 'https://api.paystack.co'
 
 
-def get_or_create_stripe_customer(business) -> str:
-    """Business owner is the billing contact. Reuses an existing Stripe
-    customer if we already made one — never create duplicates."""
+class PaystackError(Exception):
+    pass
+
+
+def _headers():
+    return {'Authorization': f'Bearer {settings.PAYSTACK_SECRET_KEY}', 'Content-Type': 'application/json'}
+
+
+def _paystack_request(method, path, **kwargs):
+    """Paystack returns HTTP 200 with {"status": false, ...} for some
+    failures rather than a 4xx — check the body's status flag, not just
+    the HTTP status code, or failures silently look like success."""
+    resp = requests.request(method, f'{PAYSTACK_BASE_URL}{path}', headers=_headers(), timeout=15, **kwargs)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get('status'):
+        raise PaystackError(data.get('message', 'Unknown Paystack error'))
+    return data['data']
+
+
+def get_or_create_paystack_customer(business) -> str:
     sub, _ = Subscription.objects.get_or_create(business=business)
-    if sub.stripe_customer_id:
-        return sub.stripe_customer_id
+    if sub.paystack_customer_code:
+        return sub.paystack_customer_code
 
-    owner = business.owner 
-    customer = stripe.Customer.create(
-        email=owner.email,
-        name=business.name,
-        metadata={'business_id': str(business.id)},
-    )
-    sub.stripe_customer_id = customer.id
-    sub.save(update_fields=['stripe_customer_id', 'updated_at'])
-    return customer.id
-
-
-def create_checkout_session(business, price_id: str, success_url: str, cancel_url: str) -> str:
-    customer_id = get_or_create_stripe_customer(business)
-    session = stripe.checkout.Session.create(
-        customer=customer_id,
-        mode='subscription',
-        line_items=[{'price': price_id, 'quantity': 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        subscription_data={'metadata': {'business_id': str(business.id)}},
-        allow_promotion_codes=True,
-    )
-    return session.url
+    owner = business.owner
+    customer = _paystack_request('POST', '/customer', json={
+        'email': owner.email,
+        'first_name': owner.first_name or business.name,
+        'metadata': {'business_id': str(business.id)},
+    })
+    sub.paystack_customer_code = customer['customer_code']
+    sub.save(update_fields=['paystack_customer_code', 'updated_at'])
+    return customer['customer_code']
 
 
-def create_billing_portal_session(business, return_url: str) -> str:
-    customer_id = get_or_create_stripe_customer(business)
-    session = stripe.billing_portal.Session.create(
-        customer=customer_id,
-        return_url=return_url,
-    )
-    return session.url
+def create_subscription_checkout(business, plan_code: str, callback_url: str) -> str:
+    """Initializes a transaction bound to a plan. The authorization_url
+    is Paystack's equivalent of a Stripe Checkout Session URL — open it
+    in a browser/WebView. Completing payment there creates the actual
+    subscription; our row updates when the matching webhook lands."""
+    get_or_create_paystack_customer(business)
+    owner = business.owner
+
+    data = _paystack_request('POST', '/transaction/initialize', json={
+        'email': owner.email,
+        'plan': plan_code,
+        'callback_url': callback_url,
+        'metadata': {'business_id': str(business.id)},
+    })
+    return data['authorization_url']
+
+
+def get_subscription_manage_link(business) -> str:
+    """Nearest thing Paystack has to a billing portal — only works once
+    a subscription already exists (i.e. after checkout has completed
+    at least once). A business that's never subscribed should be sent
+    through create_subscription_checkout instead."""
+    sub, _ = Subscription.objects.get_or_create(business=business)
+    if not sub.paystack_subscription_code:
+        raise PaystackError('No active subscription to manage yet.')
+    data = _paystack_request('GET', f'/subscription/manage/link/{sub.paystack_subscription_code}')
+    return data['link']
+
+
+def cancel_subscription(business) -> None:
+    sub, _ = Subscription.objects.get_or_create(business=business)
+    if not sub.paystack_subscription_code or not sub.paystack_email_token:
+        raise PaystackError('No active subscription to cancel.')
+    _paystack_request('POST', '/subscription/disable', json={
+        'code': sub.paystack_subscription_code,
+        'token': sub.paystack_email_token,
+    })
+    # Status flips to CANCELED via the resulting subscription.disable
+    # webhook, not here — keeps one source of truth for state transitions.
 
 
 # ── Webhook handling ──────────────────────────────────────────────────────
 
-_PLAN_TIER_BY_PRICE = {}  # populated below from settings
+_PLAN_TIER_BY_CODE = {}
 
 
-def _price_to_plan_tier(price_id: str) -> str:
-    global _PLAN_TIER_BY_PRICE
-    if not _PLAN_TIER_BY_PRICE:
-        _PLAN_TIER_BY_PRICE = {v: k for k, v in settings.STRIPE_PRICE_IDS.items()}
-    return _PLAN_TIER_BY_PRICE.get(price_id, Subscription.PlanTier.BASIC)
+def _plan_code_to_tier(plan_code: str) -> str:
+    global _PLAN_TIER_BY_CODE
+    if not _PLAN_TIER_BY_CODE:
+        _PLAN_TIER_BY_CODE = {v: k for k, v in settings.PAYSTACK_PLAN_CODES.items()}
+    return _PLAN_TIER_BY_CODE.get(plan_code, Subscription.PlanTier.BASIC)
 
 
-def handle_stripe_event(event: dict) -> None:
-    """Dispatches by event type. Every handler is idempotent — Stripe
-    retries webhooks, so re-processing the same event must be a no-op."""
-    event_type = event['type']
-    handler = _HANDLERS.get(event_type)
+def verify_webhook_signature(payload: bytes, signature_header: str) -> bool:
+    """Paystack signs the raw request body with HMAC-SHA512 using your
+    secret key. Use compare_digest, not ==, to avoid a timing side-channel."""
+    if not signature_header:
+        return False
+    computed = hmac.new(settings.PAYSTACK_SECRET_KEY.encode('utf-8'), payload, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(computed, signature_header)
+
+
+def handle_paystack_event(event: dict) -> None:
+    handler = _HANDLERS.get(event.get('event'))
     if handler is None:
-        logger.info(f"Unhandled Stripe event type: {event_type}")
+        logger.info(f"Unhandled Paystack event type: {event.get('event')}")
         return
-    handler(event['data']['object'])
+    handler(event['data'])
 
 
-def _handle_checkout_completed(session: dict) -> None:
-    business_id = session.get('metadata', {}).get('business_id') \
-        or session.get('subscription_data', {}).get('metadata', {}).get('business_id')
+def _handle_charge_success(data: dict) -> None:
+    if not data.get('plan'):
+        return  # a one-off charge unrelated to a subscription plan
+    business_id = (data.get('metadata') or {}).get('business_id')
+    customer_code = (data.get('customer') or {}).get('customer_code')
     if not business_id:
-        logger.error(f"checkout.session.completed with no business_id metadata: {session.get('id')}")
+        logger.error(f"charge.success with no business_id metadata: {data.get('reference')}")
         return
-    _sync_subscription_from_stripe_id(business_id, session.get('subscription'))
+    _sync_customer_code(business_id, customer_code)
 
 
-def _handle_subscription_updated(subscription: dict) -> None:
-    business_id = subscription.get('metadata', {}).get('business_id')
-    if not business_id:
-        # Fall back to looking up by stripe_subscription_id if metadata is missing
-        sub = Subscription.objects.filter(stripe_subscription_id=subscription['id']).first()
-        if sub is None:
-            logger.error(f"subscription.updated for unknown business: {subscription['id']}")
-            return
-        _apply_stripe_subscription(sub, subscription)
+def _handle_subscription_create(data: dict) -> None:
+    business_id = (data.get('metadata') or {}).get('business_id')
+    if business_id:
+        _sync_subscription(business_id, data)
         return
-    _sync_subscription_from_stripe_id(business_id, subscription['id'])
+    customer_code = (data.get('customer') or {}).get('customer_code')
+    sub = Subscription.objects.filter(paystack_customer_code=customer_code).first()
+    if sub is None:
+        logger.error(f"subscription.create for unknown customer: {customer_code}")
+        return
+    _apply_paystack_subscription(sub, data)
 
 
-def _handle_subscription_deleted(subscription: dict) -> None:
-    sub = Subscription.objects.filter(stripe_subscription_id=subscription['id']).first()
+def _handle_subscription_disable(data: dict) -> None:
+    sub = Subscription.objects.filter(paystack_subscription_code=data.get('subscription_code')).first()
     if sub is None:
         return
     sub.status = Subscription.Status.CANCELED
     sub.save(update_fields=['status', 'updated_at'])
 
 
-def _sync_subscription_from_stripe_id(business_id: str, stripe_subscription_id: str) -> None:
+def _handle_invoice_payment_failed(data: dict) -> None:
+    sub_code = (data.get('subscription') or {}).get('subscription_code')
+    sub = Subscription.objects.filter(paystack_subscription_code=sub_code).first()
+    if sub is None:
+        return
+    sub.status = Subscription.Status.PAST_DUE
+    sub.save(update_fields=['status', 'updated_at'])
+
+
+def _sync_customer_code(business_id: str, customer_code: str) -> None:
     from business.models import Business
     try:
         business = Business.objects.get(id=business_id)
     except Business.DoesNotExist:
-        logger.error(f"Stripe webhook referenced unknown business_id={business_id}")
+        logger.error(f'Paystack webhook referenced unknown business_id={business_id}')
         return
-
     sub, _ = Subscription.objects.get_or_create(business=business)
-    stripe_sub = stripe.Subscription.retrieve(stripe_subscription_id)
-    _apply_stripe_subscription(sub, stripe_sub)
+    if customer_code:
+        sub.paystack_customer_code = customer_code
+        sub.save(update_fields=['paystack_customer_code', 'updated_at'])
 
 
-def _apply_stripe_subscription(sub: Subscription, stripe_sub: dict) -> None:
-    price_id = stripe_sub['items']['data'][0]['price']['id']
-    sub.stripe_subscription_id = stripe_sub['id']
-    sub.stripe_price_id = price_id
-    sub.plan_tier = _price_to_plan_tier(price_id)
-    sub.status = stripe_sub['status']
-    sub.cancel_at_period_end = stripe_sub.get('cancel_at_period_end', False)
-    period_end = stripe_sub.get('current_period_end')
-    if period_end:
-        sub.current_period_end = timezone.datetime.fromtimestamp(period_end, tz=timezone.utc)
+def _sync_subscription(business_id: str, data: dict) -> None:
+    from business.models import Business
+    try:
+        business = Business.objects.get(id=business_id)
+    except Business.DoesNotExist:
+        logger.error(f'Paystack webhook referenced unknown business_id={business_id}')
+        return
+    sub, _ = Subscription.objects.get_or_create(business=business)
+    _apply_paystack_subscription(sub, data)
+
+
+def _apply_paystack_subscription(sub: Subscription, data: dict) -> None:
+    plan = data.get('plan') or {}
+    plan_code = plan.get('plan_code')
+    sub.paystack_subscription_code = data.get('subscription_code', sub.paystack_subscription_code)
+    sub.paystack_email_token = data.get('email_token', sub.paystack_email_token)
+    if plan_code:
+        sub.plan_code = plan_code
+        sub.plan_tier = _plan_code_to_tier(plan_code)
+    sub.status = Subscription.Status.ACTIVE
+    next_payment = data.get('next_payment_date')
+    if next_payment:
+        from django.utils.dateparse import parse_datetime
+        sub.current_period_end = parse_datetime(next_payment)
+    sub.cancel_at_period_end = False
     sub.save()
 
 
 _HANDLERS = {
-    'checkout.session.completed': _handle_checkout_completed,
-    'customer.subscription.updated': _handle_subscription_updated,
-    'customer.subscription.deleted': _handle_subscription_deleted,
+    'charge.success':          _handle_charge_success,
+    'subscription.create':     _handle_subscription_create,
+    'subscription.disable':    _handle_subscription_disable,
+    'subscription.not_renew':  _handle_subscription_disable,
+    'invoice.payment_failed':  _handle_invoice_payment_failed,
 }

@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.pagination import CursorPagination
 
 
+from billing.permissions import HasActiveSubscription
 from business.models import Business
 from business.utils import get_user_business
 from .models import Customer
@@ -25,6 +26,15 @@ class CustomerViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = CustomerCursorPagination
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
+    
+    
+    
+    WRITE_ACTIONS = {'create', 'update', 'partial_update', 'deactivate', 'reactivate'}
+
+    def get_permissions(self):
+        if self.action in self.WRITE_ACTIONS:
+            return [permissions.IsAuthenticated(), HasActiveSubscription()]
+        return [permissions.IsAuthenticated()]
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -54,6 +64,8 @@ class CustomerViewSet(viewsets.ModelViewSet):
                 Q(phone__icontains=search)
             )
         return queryset
+    
+    
 
     def perform_create(self, serializer):
         business = get_user_business(self.request.user)

@@ -1,0 +1,11 @@
+<!-- billing/templates/billing/cancel.html -->
+
+{% block content %}
+
+  <h1>Checkout canceled</h1>
+  <p>No payment was made. You can try again anytime.</p>
+
+  <a href="{% url 'billing-plans' %}" class="btn">View Plans</a>
+  <a href="{% url 'billing-dashboard' %}" class="btn">Back to Dashboard</a>
+
+{% endblock %}

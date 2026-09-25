@@ -1,7 +1,12 @@
 <!-- billing/templates/billing/dashboard.html -->
-{% extends "billing/base.html" %}
-{% block content %}
+
+
+{% block content %} 
+
+
   <h1>{{ business.name }} — Billing</h1>
+
+  <p>{{ status_message }}</p>
 
   <div class="status-card">
     <p>Plan: <strong>{{ subscription.get_plan_tier_display }}</strong></p>
@@ -14,9 +19,11 @@
     {% endif %}
   </div>
 
-  {% if subscription.stripe_customer_id %}
-    <a href="{% url 'billing-portal' %}" class="btn">Manage Billing</a>
-  {% else %}
-    <a href="{% url 'billing-plans' %}" class="btn btn-primary">Choose a Plan</a>
+  {% if subscription.status == 'past_due' %}
+    <p style="color:#a05f00;">Your account will lock automatically if this isn't resolved soon.</p>
+  {% elif subscription.status == 'canceled' %}
+    <p style="color:#c0392b;">Your team currently has no access to BillBuzz.</p>
   {% endif %}
+
+  <a href="{% url cta_url %}" class="btn btn-primary">{{ cta_label }}</a>
 {% endblock %}

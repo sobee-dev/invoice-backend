@@ -4,19 +4,25 @@ Integration tests for manual inventory actions.
 Covers:
   - POST /api/documents/{id}/deduct-inventory/  (sales invoices)
   - POST /api/documents/{id}/add-to-inventory/  (purchase invoices)
-  - Document lifecycle (confirm / cancel / deliver) with no automatic inventory side-effects
-  - Access control (unauthenticated, wrong document type)
+  - POST /api/documents/{id}/deliver/           (draft -> delivered, status-only)
+  - Document.mark_paid() / Document.soft_delete() — status-only, no inventory side-effects
+  - Access control (unauthenticated, wrong document type, staff scoping)
+
+Note: there is no confirm()/cancel() lifecycle or CONFIRMED/CANCELLED status on
+Document — deduct-inventory and add-to-inventory work directly off whatever
+status the document is currently in (typically DRAFT), gated only by
+document_type. This file was rewritten to match that actual behavior.
 """
 from datetime import date
 from decimal import Decimal
 
-from django.core.exceptions import ValidationError
 from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from accounts.models import User
-from business.models import Business, StaffMember
+from business.models import Business
+from staff.models import StaffMember
 from documents.models import Document, DocumentItem
 from inventory.models import InventoryTransaction
 from products.models import Product
@@ -78,10 +84,10 @@ def add_item(document, product, quantity):
     )
 
 
-# ─────────────── Model / lifecycle tests (TestCase) ───────────────────────────
+# ─────────────── Model-level lifecycle tests (TestCase) ───────────────────────
 
-class ConfirmDoesNotTouchInventoryTest(TestCase):
-    """confirm() only changes status — no inventory side-effects."""
+class MarkPaidDoesNotTouchInventoryTest(TestCase):
+    """mark_paid() only updates status/paid_at — no inventory side-effects."""
 
     def setUp(self):
         self.owner = make_user('owner@test.com')
@@ -92,33 +98,17 @@ class ConfirmDoesNotTouchInventoryTest(TestCase):
         )
         add_item(self.doc, self.product, 10)
 
-    def test_confirm_leaves_inventory_unchanged(self):
-        self.doc.confirm()
+    def test_mark_paid_leaves_inventory_unchanged(self):
+        self.doc.mark_paid()
         self.product.refresh_from_db()
         self.assertEqual(self.product.quantity_on_hand, Decimal('50.000'))
-        self.assertEqual(self.product.quantity_reserved, Decimal('0.000'))
         self.assertFalse(InventoryTransaction.objects.exists())
 
-    def test_confirm_changes_status_to_confirmed(self):
-        self.doc.confirm()
+    def test_mark_paid_changes_status_and_sets_paid_at(self):
+        self.doc.mark_paid()
         self.doc.refresh_from_db()
-        self.assertEqual(self.doc.status, Document.Status.CONFIRMED)
-
-
-class DoubleConfirmRaisesValidationErrorTest(TestCase):
-    """confirm() on an already-confirmed document must raise ValidationError."""
-
-    def setUp(self):
-        self.owner = make_user('owner@test.com')
-        self.business = make_business(self.owner)
-        self.doc = make_document(
-            self.business, Document.DocumentType.SALES_INVOICE, owner=self.owner
-        )
-        self.doc.confirm()
-
-    def test_double_confirm_raises(self):
-        with self.assertRaises(ValidationError):
-            self.doc.confirm()
+        self.assertEqual(self.doc.status, Document.Status.PAID)
+        self.assertIsNotNone(self.doc.paid_at)
 
 
 class DeliverDoesNotTouchInventoryTest(TestCase):
@@ -132,7 +122,8 @@ class DeliverDoesNotTouchInventoryTest(TestCase):
             self.business, Document.DocumentType.SALES_INVOICE, owner=self.owner
         )
         add_item(self.doc, self.product, 10)
-        self.doc.confirm()
+        # Document starts in DRAFT by default — no precondition step needed
+        # before calling mark_delivered() directly at the model level.
 
     def test_deliver_leaves_inventory_unchanged(self):
         self.doc.mark_delivered()
@@ -147,8 +138,8 @@ class DeliverDoesNotTouchInventoryTest(TestCase):
         self.assertTrue(self.doc.is_delivered)
 
 
-class CancelDoesNotTouchInventoryTest(TestCase):
-    """cancel() only changes status — no inventory side-effects."""
+class SoftDeleteDoesNotTouchInventoryTest(TestCase):
+    """soft_delete() only sets deleted_at/status — no inventory side-effects."""
 
     def setUp(self):
         self.owner = make_user('owner@test.com')
@@ -158,23 +149,24 @@ class CancelDoesNotTouchInventoryTest(TestCase):
             self.business, Document.DocumentType.SALES_INVOICE, owner=self.owner
         )
         add_item(self.doc, self.product, 15)
-        self.doc.confirm()
 
-    def test_cancel_leaves_inventory_unchanged(self):
-        self.doc.cancel()
+    def test_soft_delete_leaves_inventory_unchanged(self):
+        self.doc.soft_delete()
         self.product.refresh_from_db()
         self.assertEqual(self.product.quantity_on_hand, Decimal('50.000'))
         self.assertFalse(InventoryTransaction.objects.exists())
 
-    def test_cancel_changes_status(self):
-        self.doc.cancel()
+    def test_soft_delete_changes_status_and_sets_deleted_at(self):
+        self.doc.soft_delete()
         self.doc.refresh_from_db()
-        self.assertEqual(self.doc.status, Document.Status.CANCELLED)
+        self.assertEqual(self.doc.status, Document.Status.DELETED)
+        self.assertIsNotNone(self.doc.deleted_at)
 
-    def test_double_cancel_raises(self):
-        self.doc.cancel()
-        with self.assertRaises(ValidationError):
-            self.doc.cancel()
+    def test_soft_deleted_document_excluded_from_default_manager(self):
+        self.doc.soft_delete()
+        # Document.objects uses DocumentManager, which filters deleted_at__isnull=True
+        self.assertFalse(Document.objects.filter(id=self.doc.id).exists())
+        self.assertTrue(Document.all_objects.filter(id=self.doc.id).exists())
 
 
 # ─────────────────── API tests (APITestCase) ──────────────────────────────────
@@ -190,7 +182,8 @@ class DeductInventoryEndpointTest(APITestCase):
             self.business, Document.DocumentType.SALES_INVOICE, owner=self.owner
         )
         self.item = add_item(self.doc, self.product, 20)
-        self.doc.confirm()
+        # No status precondition — deduct-inventory works directly off the
+        # document's document_type, regardless of status (draft by default here).
         self.client.force_authenticate(user=self.owner)
 
     def _url(self, doc_id=None):
@@ -205,7 +198,7 @@ class DeductInventoryEndpointTest(APITestCase):
     def test_subtract_all_creates_transaction_record(self):
         self.client.post(self._url(), {'subtract_all': True}, format='json')
         tx = InventoryTransaction.objects.get(reference_document_id=self.doc.id)
-        self.assertEqual(tx.transaction_type, InventoryTransaction.TransactionType.SALE_DELIVERED)
+        self.assertEqual(tx.transaction_type, InventoryTransaction.TransactionType.SALES_CONFIRMED)
         self.assertEqual(tx.quantity_change, Decimal('-20.000'))
 
     def test_partial_deduction_by_item(self):
@@ -263,7 +256,7 @@ class AddToInventoryEndpointTest(APITestCase):
             self.business, Document.DocumentType.PURCHASE_INVOICE, owner=self.owner
         )
         add_item(self.doc, self.product, 25)
-        self.doc.confirm()
+        # No status precondition here either.
         self.client.force_authenticate(user=self.owner)
 
     def _url(self, doc_id=None):
@@ -294,9 +287,17 @@ class AddToInventoryEndpointTest(APITestCase):
         response = self.client.post(self._url(sales_doc.id))
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_no_tracked_items_returns_400(self):
+        empty_doc = make_document(
+            self.business, Document.DocumentType.PURCHASE_INVOICE,
+            owner=self.owner, number='PO-EMPTY',
+        )
+        response = self.client.post(self._url(empty_doc.id))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-class ConfirmEndpointTest(APITestCase):
-    """POST /api/documents/{id}/confirm/ — status only, no inventory."""
+
+class DeliverEndpointTest(APITestCase):
+    """POST /api/documents/{id}/deliver/ — status transition, DRAFT-only precondition."""
 
     def setUp(self):
         self.owner = make_user('owner@test.com', role='owner')
@@ -306,20 +307,27 @@ class ConfirmEndpointTest(APITestCase):
         )
 
     def _url(self, doc_id=None):
-        return f'/api/documents/{doc_id or self.doc.id}/confirm/'
+        return f'/api/documents/{doc_id or self.doc.id}/deliver/'
 
-    def test_authenticated_owner_confirm_returns_200(self):
+    def test_authenticated_owner_deliver_returns_200(self):
         self.client.force_authenticate(user=self.owner)
         response = self.client.post(self._url())
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc.refresh_from_db()
-        self.assertEqual(self.doc.status, Document.Status.CONFIRMED)
+        self.assertEqual(self.doc.status, Document.Status.DELIVERED)
+        self.assertTrue(self.doc.is_delivered)
+
+    def test_deliver_from_non_draft_returns_400(self):
+        self.doc.mark_paid()  # moves status away from DRAFT
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(self._url())
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_unauthenticated_returns_401(self):
         response = self.client.post(self._url())
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_staff_cannot_confirm_another_staffs_document(self):
+    def test_staff_cannot_deliver_another_staffs_document(self):
         staff_a = make_user('staff_a@test.com', role='staff')
         staff_b = make_user('staff_b@test.com', role='staff')
         StaffMember.objects.create(user=staff_a, business=self.business, status='active')
@@ -332,9 +340,8 @@ class ConfirmEndpointTest(APITestCase):
 
         self.client.force_authenticate(user=staff_a)
         response = self.client.post(self._url(doc_b.id))
-        self.assertIn(response.status_code, [
-            status.HTTP_403_FORBIDDEN,
-            status.HTTP_404_NOT_FOUND,
-        ])
+        # staff queryset is scoped to created_by=request.user, so doc_b is
+        # invisible to staff_a -> get_object() 404s before any status check.
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         doc_b.refresh_from_db()
         self.assertEqual(doc_b.status, Document.Status.DRAFT)

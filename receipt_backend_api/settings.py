@@ -100,15 +100,16 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "BillBuzz <noreply@yourdomain.com>")
 
 
-STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
-STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
-STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
-STRIPE_PRICE_IDS = {
-    'basic': os.getenv('STRIPE_PRICE_BASIC'),
-    'pro':   os.getenv('STRIPE_PRICE_PRO'),
+# settings.py
+PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY')
+PAYSTACK_PUBLIC_KEY = os.getenv('PAYSTACK_PUBLIC_KEY')  # mobile/web checkout page may need this too
+PAYSTACK_PLAN_CODES = {
+    'basic': os.getenv('PAYSTACK_PLAN_CODE_BASIC', ''),
+    'pro':   os.getenv('PAYSTACK_PLAN_CODE_PRO', ''),
 }
-# FRONTEND_BILLING_URL = env('FRONTEND_BILLING_URL', default='https://billing.billbuzz.app')
 
+
+BILLING_REMINDERS_ENABLED = os.getenv("BILLING_REMINDERS_ENABLED", "False") == "True"
 
 # ── Middleware ────────────────────────────────────────────────────────────────
 MIDDLEWARE = [
@@ -191,9 +192,9 @@ REST_FRAMEWORK = {
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": ( timedelta(minutes=60) if IS_PROD else timedelta(minutes=3)
+    "ACCESS_TOKEN_LIFETIME": ( timedelta(minutes=60) if IS_PROD else timedelta(minutes=30)
     ),
-    "REFRESH_TOKEN_LIFETIME": ( timedelta(hours=10) if IS_PROD else timedelta(minutes=20)
+    "REFRESH_TOKEN_LIFETIME": ( timedelta(hours=10) if IS_PROD else timedelta(minutes=60)
     ),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True, 

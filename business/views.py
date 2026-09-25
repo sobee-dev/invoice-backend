@@ -1,13 +1,15 @@
 from decimal import Decimal
-import re
+
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.response import Response
+
 from django.shortcuts import get_object_or_404
 from django.db.models import Sum
+from django.utils import timezone
+from billing.models import Subscription
+from billing.permissions import HasActiveSubscription
 from business.services import get_full_summary_data
 from staff.models import StaffMember
-from rest_framework.response import Response
 from .models import Business, SyncStatus
 from .serializers import (
     BusinessSerializer,
@@ -32,6 +34,7 @@ from business.utils import get_user_business
 
 ALLOWED_UPLOAD_FOLDERS = {'business-logos', 'business-signatures', 'product-images'}
 
+TRIAL_DAYS = 15
 
 def _build_public_id(folder, business_id, resource_id=None):
     """
@@ -174,6 +177,16 @@ class BusinessViewSet(viewsets.ModelViewSet):
     """
     queryset = Business.objects.all()
     permission_classes = [permissions.IsAuthenticated]
+    
+    def get_permissions(self):
+        # 'create' and the POST branch of 'me' both run before any Business
+        # row exists for this user. HasActiveSubscription needs an existing
+        # business to find a subscription on — gating either would permanently
+        # block onboarding for a brand-new signup. Only PATCH on 'me' (editing
+        # an existing business) is gated.
+        if self.action == 'manage_my_business' and self.request.method == 'PATCH':
+            return [permissions.IsAuthenticated(), HasActiveSubscription()]
+        return [permissions.IsAuthenticated()]
 
     def get_serializer_class(self):
         """
@@ -199,12 +212,18 @@ class BusinessViewSet(viewsets.ModelViewSet):
         if self.request.user.is_staff:
             return queryset
         return queryset.filter(owner=self.request.user)
+    
+    def perform_create(self, serializer):
+                business = serializer.save(owner=self.request.user)
+                Subscription.objects.get_or_create(
+                    business=business,
+                    defaults={'trial_ends_at': timezone.now() + timezone.timedelta(days=TRIAL_DAYS)},
+                )    
 
     @action(detail=False, methods=['get', 'patch', 'post'], url_path='me')
     def manage_my_business(self, request):
         user_business = self.get_queryset().first()
-        
-        
+
         if not user_business and request.user.role == 'staff':
             staff_profile = StaffMember.objects.filter(
                 user=request.user, status='active'
@@ -215,7 +234,7 @@ class BusinessViewSet(viewsets.ModelViewSet):
         if request.method == 'GET':
             if not user_business:
                 return Response({"detail": "No business found."}, status=status.HTTP_404_NOT_FOUND)
-            serializer = BusinessSerializer(user_business)  # has 'id' in its fields list — BusinessUpdateSerializer does not
+            serializer = BusinessSerializer(user_business)
             return Response(serializer.data)
 
         if request.method == 'POST':
@@ -223,14 +242,16 @@ class BusinessViewSet(viewsets.ModelViewSet):
                 return Response({"detail": "Business already exists."}, status=status.HTTP_400_BAD_REQUEST)
             serializer = BusinessCreateSerializer(data=request.data, context={'request': request})
             serializer.is_valid(raise_exception=True)
-            serializer.save(owner=request.user)
+            business = serializer.save(owner=request.user)
+            Subscription.objects.get_or_create(
+                business=business,
+                defaults={'trial_ends_at': timezone.now() + timezone.timedelta(days=TRIAL_DAYS)},
+            )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         if request.method == 'PATCH':
             if not user_business:
                 return Response({"detail": "Business not found."}, status=status.HTTP_404_NOT_FOUND)
-            # Staff should not be able to edit business settings via their own dashboard —
-            # only owners can PATCH here.
             if request.user.role != 'owner':
                 return Response(
                     {"detail": "Only business owners can update business details."},
@@ -240,8 +261,6 @@ class BusinessViewSet(viewsets.ModelViewSet):
             serializer.is_valid(raise_exception=True)
             serializer.save()
             return Response(serializer.data)
-        
-        
         
             
     @action(detail=True, methods=['post'], url_path='sync')

@@ -118,7 +118,7 @@ class Document(models.Model):
             models.Index(fields=['business']),
             models.Index(fields=['document_type']),
             models.Index(fields=['status']),
-            models.Index(fields=['-document_date']),
+            models.Index(fields=['created_at']),
         ]
 
     # ── Helpers ───────────────────────────────────────────────────────────────

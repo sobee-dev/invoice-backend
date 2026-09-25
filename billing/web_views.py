@@ -7,7 +7,7 @@ from django.contrib import messages
 
 from business.utils import get_user_business
 from .models import Subscription
-from .services import create_checkout_session, create_billing_portal_session
+from .services import create_subscription_checkout, get_subscription_manage_link, PaystackError
 
 
 def login_view(request):
@@ -42,7 +42,30 @@ def dashboard_view(request):
         return redirect('billing-login')
 
     sub, _ = Subscription.objects.get_or_create(business=business)
-    return render(request, 'billing/dashboard.html', {'business': business, 'subscription': sub})
+
+    if sub.status == Subscription.Status.TRIALING:
+        status_message = (
+            f"You're on a free trial until {sub.trial_ends_at:%d %b %Y}."
+            if sub.trial_ends_at else "You're on a free trial."
+        )
+        cta_url, cta_label = 'billing-plans', 'Subscribe now'
+    elif sub.status == Subscription.Status.ACTIVE:
+        status_message = "Your subscription is active."
+        cta_url, cta_label = 'billing-portal', 'Manage billing'
+    elif sub.status == Subscription.Status.PAST_DUE:
+        status_message = "Your last payment failed. Update your billing to avoid losing access."
+        cta_url, cta_label = 'billing-portal', 'Update payment method'
+    else:  # canceled
+        status_message = "Your subscription is inactive."
+        cta_url, cta_label = 'billing-plans', 'Subscribe now'
+
+    return render(request, 'billing/dashboard.html', {
+        'business': business,
+        'subscription': sub,
+        'status_message': status_message,
+        'cta_url': cta_url,
+        'cta_label': cta_label,
+    })
 
 
 @login_required(login_url='billing-login')
@@ -51,8 +74,8 @@ def plans_view(request):
     return render(request, 'billing/plans.html', {
         'business': business,
         'plans': [
-            {'tier': 'basic', 'label': 'Basic', 'price': '$9/mo'},
-            {'tier': 'pro',   'label': 'Pro',   'price': '$29/mo'},
+            {'tier': 'basic', 'label': 'Basic', 'price': '₦9,000/mo'},
+            {'tier': 'pro',   'label': 'Pro',   'price': '₦29,000/mo'},
         ],
     })
 
@@ -60,27 +83,29 @@ def plans_view(request):
 @login_required(login_url='billing-login')
 def start_checkout(request, tier: str):
     business = get_user_business(request.user)
-    price_id = settings.STRIPE_PRICE_IDS.get(tier)
-    if not price_id:
+    plan_code = settings.PAYSTACK_PLAN_CODES.get(tier)
+    if not plan_code:
         messages.error(request, 'Unknown plan.')
         return redirect('billing-plans')
-
-    checkout_url = create_checkout_session(
-        business=business,
-        price_id=price_id,
-        success_url=request.build_absolute_uri('/billing/success/'),
-        cancel_url=request.build_absolute_uri('/billing/cancel/'),
-    )
+    try:
+        checkout_url = create_subscription_checkout(
+            business=business, plan_code=plan_code,
+            callback_url=request.build_absolute_uri('/billing/success/'),
+        )
+    except PaystackError:
+        messages.error(request, 'Could not start checkout right now. Try again shortly.')
+        return redirect('billing-plans')
     return redirect(checkout_url)
 
 
 @login_required(login_url='billing-login')
 def open_portal(request):
     business = get_user_business(request.user)
-    portal_url = create_billing_portal_session(
-        business=business,
-        return_url=request.build_absolute_uri('/billing/'),
-    )
+    try:
+        portal_url = get_subscription_manage_link(business)
+    except PaystackError:
+        messages.error(request, 'No active subscription to manage yet.')
+        return redirect('billing-dashboard')
     return redirect(portal_url)
 
 

@@ -1,0 +1,10 @@
+<!-- billing/templates/billing/success.html -->
+
+{% block content %} 
+
+  <h1>Payment successful</h1>
+  <p>Your BillBuzz subscription is now active. It may take a minute for this to reflect everywhere.</p>
+
+  <a href="{% url 'billing-dashboard' %}" class="btn btn-primary">Go to Billing Dashboard</a>
+
+{% endblock %} 

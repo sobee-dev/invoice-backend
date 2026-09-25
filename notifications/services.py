@@ -2,9 +2,12 @@ import logging
 from datetime import timedelta
 from typing import Iterable, Optional
 
+from django.core.cache import cache
 import requests
 from django.utils import timezone
 from djangorestframework_camel_case.util import camelize
+
+from notifications.cache_keys import unread_count_cache_key
 
 from .models import PushToken, Notification
 
@@ -135,6 +138,10 @@ def notify(
     entity involved — a product id for low-stock, an invoice id for
     overdue — so throttling one product's alerts doesn't suppress
     another's.
+
+    Invalidates the cached unread_count for this business the moment a
+    new row lands, so the badge reflects it on the very next poll
+    instead of waiting out the cache TTL in views.py.
     """
     if dedup_key and cooldown_hours:
         cutoff = timezone.now() - timedelta(hours=cooldown_hours)
@@ -158,6 +165,7 @@ def notify(
         body=body,
         data=payload,
     )
+    cache.delete(unread_count_cache_key(business.id))
 
     target_user = user if user is not None else getattr(business, 'owner', None)
 

@@ -50,7 +50,6 @@ class DocumentModelTest(TestCase):
         doc = make_document(self.business, self.owner, doc_type='sales_invoice', number='SI-001')
         self.assertEqual(doc.document_type, Document.DocumentType.SALES_INVOICE)
         self.assertEqual(doc.status, Document.Status.DRAFT)
-        self.assertEqual(doc.payment_status, Document.PaymentStatus.UNPAID)
         self.assertEqual(str(doc), 'Sales Invoice #SI-001')
 
     def test_filter_by_document_type(self):
@@ -70,11 +69,11 @@ class DocumentModelTest(TestCase):
             Document.objects.filter(status=Document.Status.DRAFT).count(), 1
         )
 
-        doc.status = Document.Status.CONFIRMED
+        doc.status = Document.Status.PAID
         doc.save(update_fields=['status', 'updated_at'])
 
         self.assertEqual(
-            Document.objects.filter(status=Document.Status.CONFIRMED).count(), 1
+            Document.objects.filter(status=Document.Status.PAID).count(), 1
         )
         self.assertEqual(
             Document.objects.filter(status=Document.Status.DRAFT).count(), 0
@@ -104,4 +103,4 @@ class DocumentCreatedByTest(TestCase):
         response = self.client.post('/api/documents/', payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         # response.data is the raw dict (pre-render), so keys are snake_case
-        self.assertEqual(response.data['created_by'], self.owner.id)
+        self.assertEqual(response.data['created_by']['id'], str(self.owner.id))

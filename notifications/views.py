@@ -1,3 +1,5 @@
+# notifications/views.py
+from django.core.cache import cache
 from django.shortcuts import render
 from django.utils import timezone
 
@@ -6,9 +8,15 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from business.utils import get_user_business
+from notifications.cache_keys import unread_count_cache_key
 
 from .models import Notification
 from .serializers import RegisterTokenSerializer, UnregisterTokenSerializer, NotificationSerializer
+
+
+UNREAD_COUNT_CACHE_TTL = 40  # seconds, kept just under the frontend's poll interval
+
+
 
 
 class PushTokenViewSet(viewsets.ViewSet):
@@ -68,6 +76,15 @@ class NotificationViewSet(viewsets.ViewSet):
     too. Every action here checks role explicitly rather than relying
     on business scoping alone — same pattern as the owner-only checks
     in staff/views.py (create_staff, invite, deactivate, etc.).
+
+    unread_count is cached per-business for UNREAD_COUNT_CACHE_TTL
+    seconds — with several staff/devices on the same business polling
+    on roughly the same interval, this collapses what would be N
+    identical COUNT queries per window into one. Anything that changes
+    read state (mark_read, mark_all_read) or creates a new notification
+    (the central notify() dispatch layer — see decisions-and-learnings)
+    must invalidate the key via unread_count_cache_key(business.id) so
+    a change is never masked by a stale cache entry.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -109,7 +126,13 @@ class NotificationViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def unread_count(self, request):
-        """GET /api/notifications/unread_count/ — for a badge indicator."""
+        """
+        GET /api/notifications/unread_count/ — for a badge indicator.
+
+        Cached per business for UNREAD_COUNT_CACHE_TTL seconds so a
+        poll from a business with several devices open doesn't turn
+        into a duplicate query per device on every tick.
+        """
         denied = self._require_owner(request)
         if denied:
             return denied
@@ -117,7 +140,13 @@ class NotificationViewSet(viewsets.ViewSet):
         business = get_user_business(request.user)
         if business is None:
             return Response({'count': 0})
-        count = Notification.objects.filter(business=business, read_at__isnull=True).count()
+
+        key = unread_count_cache_key(business.id)
+        count = cache.get(key)
+        if count is None:
+            count = Notification.objects.filter(business=business, read_at__isnull=True).count()
+            cache.set(key, count, UNREAD_COUNT_CACHE_TTL)
+
         return Response({'count': count})
 
     @action(detail=True, methods=['post'])
@@ -136,6 +165,7 @@ class NotificationViewSet(viewsets.ViewSet):
         if notification.read_at is None:
             notification.read_at = timezone.now()
             notification.save(update_fields=['read_at'])
+            cache.delete(unread_count_cache_key(business.id))
 
         return Response(NotificationSerializer(notification).data)
 
@@ -152,4 +182,5 @@ class NotificationViewSet(viewsets.ViewSet):
         updated = Notification.objects.filter(
             business=business, read_at__isnull=True
         ).update(read_at=timezone.now())
+        cache.delete(unread_count_cache_key(business.id))
         return Response({'updated': updated})
