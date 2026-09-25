@@ -28,15 +28,22 @@ class DocumentUserSerializer(serializers.ModelSerializer):
 
 class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
-
+    product_image_url = serializers.SerializerMethodField()
+    
     class Meta:
         model = DocumentItem
-        fields = ['id', 'product', 'product_name', 'description', 'quantity', 'unit_price', 'total']
+        fields = ['id', 'product', 'product_name', 'description', 'quantity', 'unit_price', 'total', 'product_image_url']
         extra_kwargs = {
             'product': {'required': False},
             'id': {'read_only': True},
             'total': {'read_only': True},
         }
+
+    def get_product_image_url(self, obj):
+        if obj.product and obj.product.image_url:
+            return obj.product.image_url
+        return None
+
     def validate(self, attrs):
         if not attrs.get('product') and not attrs.get('product_name'):
             raise serializers.ValidationError('Either product or product_name is required.')
@@ -44,7 +51,7 @@ class DocumentItemSerializer(serializers.ModelSerializer):
 
 
 class DocumentSerializer(serializers.ModelSerializer):
-    created_by = DocumentUserSerializer(read_only=True)  # was DocumentItemSerializer — bug
+    created_by = DocumentUserSerializer(read_only=True)  
     items = DocumentItemSerializer(many=True, required=False)
 
     class Meta:
