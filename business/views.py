@@ -214,11 +214,11 @@ class BusinessViewSet(viewsets.ModelViewSet):
         return queryset.filter(owner=self.request.user)
     
     def perform_create(self, serializer):
-                business = serializer.save(owner=self.request.user)
-                Subscription.objects.get_or_create(
-                    business=business,
-                    defaults={'trial_ends_at': timezone.now() + timezone.timedelta(days=TRIAL_DAYS)},
-                )    
+        business = serializer.save(owner=self.request.user)
+        Subscription.objects.get_or_create(
+            business=business,
+            defaults={'trial_ends_at': timezone.now() + timezone.timedelta(days=TRIAL_DAYS)},
+        )    
 
     @action(detail=False, methods=['get', 'patch', 'post'], url_path='me')
     def manage_my_business(self, request):
