@@ -188,6 +188,7 @@ class BusinessUpdateSerializer(BusinessBaseSerializer):
     class Meta(BusinessBaseSerializer.Meta):
         # model = Business
         fields = [
+            'id',
             'name',
             'description',
             'address_one',

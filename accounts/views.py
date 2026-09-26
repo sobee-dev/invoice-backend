@@ -11,7 +11,7 @@ from rest_framework.views import APIView
 from django.contrib.auth import authenticate, get_user_model
 from django.utils import timezone
 import os
-import requests
+
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from django.db import transaction
@@ -37,13 +37,13 @@ from .serializers import (
     UserListSerializer,
     UserWithBusinessSerializer,
     AdminDashboardSerializer,
-    LoginResponseSerializer,
+    
 )
 
 from rest_framework_simplejwt.views import TokenRefreshView
 from .token import SessionLimitedTokenRefreshSerializer
 from django.http import HttpResponse
-from django.views.decorators.http import require_GET
+
 
 
 
@@ -113,10 +113,8 @@ class UserViewSet(viewsets.ModelViewSet):
         
         response = Response({
             'user': UserSerializer(user).data,
-            'tokens': {
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            },
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
             'requires_password_change': user.requires_password_change,
             'message': 'User registered successfully'
         }, status=status.HTTP_201_CREATED)
@@ -401,151 +399,71 @@ class UserViewSet(viewsets.ModelViewSet):
             'refresh': str(refresh),
         })    
 
-# ============================================
-# OAUTH MOBILE BRIDGE — standalone function view, not a ViewSet action
-# ============================================
 
-@require_GET
-def oauth_mobile_bridge(request):
-    code = request.GET.get('code', '')
-    state = request.GET.get('state', '')
-    error = request.GET.get('error', '')
-
-    deep_link = (
-        f"billbuzz://oauth/callback?error={error}"
-        if error else
-        f"billbuzz://oauth/callback?code={code}&state={state}"
-    )
-
-    html = f"""<!DOCTYPE html>
-    <html><head><meta http-equiv="refresh" content="0;url={deep_link}"></head>
-    <body>
-    <p>Redirecting back to the app…</p>
-    <script>window.location.replace("{deep_link}");</script>
-    </body></html>"""
-    return HttpResponse(html)
-
-
-# ============================================
-# GOOGLE OAUTH VIEW
-# ============================================
-class GoogleCallbackView(APIView):
-    """
-    Handle Google OAuth callback.
-    Exchanges authorization code for tokens and creates/updates user.
-    """
-    permission_classes = [permissions.AllowAny]
-    authentication_classes = []
-
-    def post(self, request):
-        """POST /api/users/google_callback/"""
-        code = request.data.get("code")
-        redirect_uri = request.data.get("redirect_uri")
-
-        if not code:
-            return Response(
-                {"error": "Authorization code is required."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # ── Step 1: Exchange code for Google tokens ──────────────────────────
-        token_response = requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code": code,
-                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-            },
-        )
-
-        if not token_response.ok:
-            return Response(
-                {"error": "Failed to exchange code with Google."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        token_data = token_response.json()
-        google_id_token_value = token_data.get("id_token")
-
-        if not google_id_token_value:
-            return Response(
-                {"error": "No ID token returned from Google."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # ── Step 2: Verify the ID token ──────────────────────────────────────
-        try:
-            user_info = id_token.verify_oauth2_token(
-                google_id_token_value,
-                google_requests.Request(),
-                os.getenv("GOOGLE_CLIENT_ID"),
-            )
-        except ValueError as e:
-            return Response(
-                {"error": f"Invalid Google token: {str(e)}"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # ── Step 3: Extract user info ────────────────────────────────────────
-        email = user_info.get("email")
-        first_name = user_info.get("given_name", "")
-        last_name = user_info.get("family_name", "")
-        email_verified = user_info.get("email_verified", False)
-
-        if not email:
-            return Response(
-                {"error": "Could not retrieve email from Google."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if not email_verified:
-            return Response(
-                {"error": "Google email is not verified."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # ── Step 4: Find or create user ──────────────────────────────────────
-        user, is_new = User.objects.get_or_create(
-            email=email,
-            defaults={
-                "first_name": first_name,
-                "last_name": last_name,
-                "is_active": True,
-            },
-        )
-
-        # Update name on every login in case it changed on Google
-        if not is_new:
-            if user.first_name != first_name or user.last_name != last_name:
-                user.first_name = first_name
-                user.last_name = last_name
-                user.save()
-
-        # ── Step 5: Fetch business and docs ──────────────────────────────
-        business = Business.objects.filter(owner=user).first()
-        
-        # ── Step 6: Generate JWT tokens ──────────────────────────────────────
-        refresh = RefreshToken.for_user(user)
-        refresh['orig_iat'] = int(timezone.now().timestamp())
-        access_token = str(refresh.access_token)
-        refresh_token = str(refresh)
-
-        return Response({
-            "user": UserSerializer(user).data,
-            "business": BusinessSerializer(business).data if business else None,
-           
-            "access": access_token,
-            "refresh": refresh_token,
-            "requires_password_change": user.requires_password_change,  # ← KEY FLAG
-            "isNew": is_new,
-            "message": "Google login successful",
-        }, status=status.HTTP_200_OK)
         
 class PasswordResetPageView(TemplateView):
     template_name = "accounts/reset_password.html"
             
 class SessionLimitedTokenRefreshView(TokenRefreshView):
     serializer_class = SessionLimitedTokenRefreshSerializer
-        
+
+ 
+GOOGLE_CLIENT_IDS = {
+    os.getenv("GOOGLE_IOS_CLIENT_ID"),
+    os.getenv("GOOGLE_ANDROID_CLIENT_ID"),
+    os.getenv("GOOGLE_WEB_CLIENT_ID"),
+}
+
+class GoogleIdTokenLoginView(APIView):
+    """
+    POST /api/users/google_login/
+    Body: { "idToken": "..." }
+    """
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        raw_token = request.data.get("id_token")
+        if not raw_token:
+            return Response({"error": "idToken is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_info = id_token.verify_oauth2_token(raw_token, google_requests.Request())
+        except ValueError as e:
+            return Response({"error": f"Invalid Google token: {e}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user_info.get("aud") not in GOOGLE_CLIENT_IDS:
+            return Response({"error": "Token was not issued for this app."}, status=status.HTTP_400_BAD_REQUEST)
+        if user_info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+            return Response({"error": "Invalid token issuer."}, status=status.HTTP_400_BAD_REQUEST)
+
+        email = user_info.get("email")
+        if not email or not user_info.get("email_verified", False):
+            return Response({"error": "Google email is missing or unverified."}, status=status.HTTP_400_BAD_REQUEST)
+
+        first_name = user_info.get("given_name", "")
+        last_name = user_info.get("family_name", "")
+
+        user, is_new = User.objects.get_or_create(
+            email=email,
+            defaults={"first_name": first_name, "last_name": last_name, "is_active": True},
+        )
+        if not is_new and (user.first_name != first_name or user.last_name != last_name):
+            user.first_name = first_name
+            user.last_name = last_name
+            user.save()
+
+        business = Business.objects.filter(owner=user).first()
+
+        refresh = RefreshToken.for_user(user)
+        refresh['orig_iat'] = int(timezone.now().timestamp())
+
+        return Response({
+            "user": UserSerializer(user).data,
+            "business": BusinessSerializer(business).data if business else None,
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "requires_password_change": user.requires_password_change,
+            "isNew": is_new,
+            "message": "Google login successful",
+        }, status=status.HTTP_200_OK)        
