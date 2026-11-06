@@ -1,15 +1,43 @@
+# business/serializers.py
 from rest_framework import serializers
 
+from billing.exceptions import PlanFeatureLocked
+from billing.plans import get_effective_plan
 from business.services import delete_cloudinary_asset
 from receipt_backend_api import settings
 from .models import Business, SyncStatus
 from accounts.models import User
 
 
+def _enforce_template_for_plan(instance, value):
+    """
+    The server side of the template rule. A business on the Free plan may only
+    pick the default template. Called by every serializer that accepts
+    selected_template_id on an existing business. The model's choices already
+    reject ids that do not exist, so this only decides which real ids the
+    current plan allows.
+    """
+    if instance is None or not value:
+        return value
+    plan = get_effective_plan(instance)
+    allowed = plan.allowed_templates
+    if value not in allowed:
+        raise PlanFeatureLocked(
+            feature='templates',
+            plan=plan.tier,
+            allowed=allowed,
+            message=(
+                f"The {plan.name} plan includes the {', '.join(allowed)} template only. "
+                "Upgrade to use the others."
+            ),
+        )
+    return value
+
+
 # --- BASE SERIALIZER FOR SHARED VALIDATION ---
 class BusinessBaseSerializer(serializers.ModelSerializer):
     """
-    Parent class to house all validation logic so it's shared 
+    Parent class to house all validation logic so it's shared
     between Create, Update, and General serializers.
     """
     owner = serializers.ReadOnlyField(source='owner.email')
@@ -38,16 +66,16 @@ class BusinessBaseSerializer(serializers.ModelSerializer):
         return value.lower() if value else value
 
     def validate_currency(self, value):
-    # 1. Check if it's empty
+        # 1. Check if it's empty
         if not value:
             return value
-        
+
         # 2. Check length (Symbols are usually 1-3 characters)
         if len(value) > 5:
             raise serializers.ValidationError("Currency symbol is too long")
-            
+
         return value
-    
+
     def validate_logo_url(self, value):
         cloud_name = settings.CLOUDINARY_STORAGE["CLOUD_NAME"]
         if not value:
@@ -55,6 +83,9 @@ class BusinessBaseSerializer(serializers.ModelSerializer):
         if f"res.cloudinary.com/{cloud_name}/" not in value:
             raise serializers.ValidationError("Logo must be uploaded via Cloudinary")
         return value
+
+    def validate_selected_template_id(self, value):
+        return _enforce_template_for_plan(self.instance, value)
 
     def validate_signatures(self, attrs):
         """Shared logic for signature validation"""
@@ -71,8 +102,9 @@ class BusinessBaseSerializer(serializers.ModelSerializer):
             attrs["signature_url"] = ""
         return attrs
 
+
 class BusinessSerializer(serializers.ModelSerializer):
-    
+
     class Meta(BusinessBaseSerializer.Meta):
         # model = Business
         fields = [
@@ -102,7 +134,7 @@ class BusinessSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = ['id', 'sync_status', 'created_at', 'server_id']
- 
+
 
 class BusinessListSerializer(BusinessBaseSerializer):
     """
@@ -110,8 +142,8 @@ class BusinessListSerializer(BusinessBaseSerializer):
     """
     owner_name = serializers.SerializerMethodField()
     owner_email = serializers.EmailField(source='owner.email', read_only=True)
-    
-    
+    sync_status_display = serializers.CharField(source='get_sync_status_display', read_only=True)
+
     class Meta:
         model = Business
         fields = [
@@ -128,7 +160,7 @@ class BusinessListSerializer(BusinessBaseSerializer):
             'created_at',
         ]
         read_only_fields = fields
-    
+
     def get_owner_name(self, obj):
         """Get owner's name"""
         full_name = f"{obj.owner.first_name} {obj.owner.last_name}".strip()
@@ -170,7 +202,7 @@ class BusinessCreateSerializer(BusinessBaseSerializer):
             'motto': {'required': False, 'allow_blank': True, 'allow_null': True},
             'signature_url': {'required': False, 'allow_blank': True},
         }
-        
+
     def validate(self, attrs):
         request = self.context.get('request')
         if request and Business.objects.filter(owner=request.user).exists():
@@ -180,6 +212,7 @@ class BusinessCreateSerializer(BusinessBaseSerializer):
     def create(self, validated_data):
         validated_data['owner'] = self.context['request'].user
         return super().create(validated_data)
+
 
 class BusinessUpdateSerializer(BusinessBaseSerializer):
     """
@@ -209,7 +242,7 @@ class BusinessUpdateSerializer(BusinessBaseSerializer):
             'signature_url',
             'onboarding_complete',
         ]
-        
+
     def validate(self, attrs):
         # Ensure tax rate is valid if tax is enabled
         tax_enabled = attrs.get('tax_enabled', self.instance.tax_enabled if self.instance else False)
@@ -217,13 +250,13 @@ class BusinessUpdateSerializer(BusinessBaseSerializer):
             tax_rate = attrs.get('tax_rate', self.instance.tax_rate if self.instance else 0)
             if tax_rate <= 0:
                 raise serializers.ValidationError({'tax_rate': 'Tax rate must be > 0 when tax is enabled'})
-        
+
         return self.validate_signatures(attrs)
 
     def update(self, instance, validated_data):
         sync_trigger_fields = [
             'name', 'address_one', 'address_two', 'phone', 'email',
-            'registration_number', 'tax_rate', 'tax_enabled', 'currency','brand_color_one', 'brand_color_two',
+            'registration_number', 'tax_rate', 'tax_enabled', 'currency', 'brand_color_one', 'brand_color_two',
         ]
         needs_sync = any(
             field in validated_data and validated_data[field] != getattr(instance, field)
@@ -231,7 +264,7 @@ class BusinessUpdateSerializer(BusinessBaseSerializer):
         )
         if needs_sync and instance.sync_status == SyncStatus.SYNCED:
             validated_data['sync_status'] = SyncStatus.PENDING
-         # Capture the previous URLs before the instance is mutated, so we
+        # Capture the previous URLs before the instance is mutated, so we
         # know what to clean up afterward.
         old_logo_url = instance.logo_url
         old_signature_url = instance.signature_url
@@ -239,7 +272,7 @@ class BusinessUpdateSerializer(BusinessBaseSerializer):
         if 'logo_url' in validated_data and old_logo_url and old_logo_url != updated.logo_url:
             delete_cloudinary_asset(old_logo_url)
         # Also fires when signature_type switches to 'text'/'none', since
-        # validate_signatures() clears signature_url to '' in that case —
+        # validate_signatures() clears signature_url to '' in that case,
         # correctly cleaning up an image that's no longer referenced.
         if 'signature_url' in validated_data and old_signature_url and old_signature_url != updated.signature_url:
             delete_cloudinary_asset(old_signature_url)
@@ -254,36 +287,36 @@ class BusinessSyncSerializer(serializers.ModelSerializer):
         model = Business
         fields = ['id', 'server_id', 'sync_status', 'updated_at']
         read_only_fields = ['id', 'updated_at']
-    
+
     def validate_sync_status(self, value):
         """Validate sync status transitions"""
         if self.instance:
             current_status = self.instance.sync_status
-            
+
             valid_transitions = {
                 SyncStatus.PENDING: [SyncStatus.SYNCED, SyncStatus.ERROR],
                 SyncStatus.SYNCED: [SyncStatus.PENDING, SyncStatus.ERROR, SyncStatus.DELETED],
                 SyncStatus.ERROR: [SyncStatus.PENDING, SyncStatus.SYNCED],
                 SyncStatus.DELETED: [],
             }
-            
+
             if value not in valid_transitions.get(current_status, []):
                 raise serializers.ValidationError(
                     f"Cannot transition from {current_status} to {value}"
                 )
-        
+
         return value
-    
+
     def validate(self, attrs):
         """Ensure server_id is set when status is SYNCED"""
         sync_status = attrs.get('sync_status', self.instance.sync_status if self.instance else None)
         server_id = attrs.get('server_id', self.instance.server_id if self.instance else None)
-        
+
         if sync_status == SyncStatus.SYNCED and not server_id:
             raise serializers.ValidationError({
                 'server_id': 'Server ID is required when sync status is SYNCED'
             })
-        
+
         return attrs
 
 
@@ -291,6 +324,9 @@ class BusinessOnboardingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Business
         fields = ['onboarding_complete', 'selected_template_id']
+
+    def validate_selected_template_id(self, value):
+        return _enforce_template_for_plan(self.instance, value)
 
     def validate(self, attrs):
         if attrs.get('onboarding_complete', False):
@@ -306,7 +342,7 @@ class BusinessOnboardingSerializer(serializers.ModelSerializer):
                 if not current(field):
                     missing_fields.append(field)
 
-            # tax_enabled=False is a valid, deliberate choice — not missing data.
+            # tax_enabled=False is a valid, deliberate choice, not missing data.
             if current('tax_enabled'):
                 tax_rate = current('tax_rate')
                 if not tax_rate or tax_rate <= 0:

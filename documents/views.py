@@ -1,30 +1,35 @@
-from decimal import Decimal
-
-from rest_framework import viewsets, status, permissions
+# documents/views.py
+from django.db import transaction
+from django.db.models import Q
+from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
-from rest_framework.pagination import CursorPagination
-from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import transaction
-from products.models import Product
+
+from accounts.permissions import BusinessActivePermission, StaffWithinPlanPermission
+from billing.plans import COUNTED_INVOICE_TYPES, INVOICES, check_limit
 from business.models import Business
-from inventory.models import InventoryTransaction
+from payments import services as payment_services
+from payments.serializers import MarkPaidSerializer, MarkUnpaidSerializer
+from receipt_backend_api.pagination import StandardPagination
 from staff.models import StaffMember
-from .models import Document, DocumentItem
-from .serializers import DocumentSerializer, DocumentListSerializer, DocumentUpdateSerializer
 
-
-class DocumentCursorPagination(CursorPagination):
-    page_size = 20
-    ordering = '-document_date'
-    cursor_query_param = 'cursor'
+from . import services as document_services
+from .models import Document
+from .serializers import DocumentListSerializer, DocumentSerializer, DocumentUpdateSerializer
 
 
 class DocumentViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
-    pagination_class = DocumentCursorPagination
-    
+    pagination_class = StandardPagination
+
+    def get_permissions(self):
+        # A view that sets its own permissions replaces the project default,
+        # so the suspended-business and staff-seat checks are listed here.
+        return [
+            permissions.IsAuthenticated(),
+            BusinessActivePermission(),
+            StaffWithinPlanPermission(),
+        ]
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -32,10 +37,15 @@ class DocumentViewSet(viewsets.ModelViewSet):
         if self.action in ['update', 'partial_update']:
             return DocumentUpdateSerializer
         return DocumentSerializer
-    
+
+    @transaction.atomic
     def perform_update(self, serializer):
-        if serializer.instance.status != Document.Status.DRAFT:
+        # Re-read the row under a lock so an edit cannot race a deduction.
+        instance = Document.objects.select_for_update().get(pk=serializer.instance.pk)
+        if instance.status != Document.Status.DRAFT:
             raise PermissionDenied("Only documents in 'DRAFT' status can be edited.")
+        if instance.stock_status in (Document.StockStatus.PARTIAL, Document.StockStatus.DEDUCTED):
+            raise PermissionDenied('Stock has already been deducted for this document, so it can no longer be edited.')
         serializer.save()
 
     def _get_base_queryset(self):
@@ -54,7 +64,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 deleted_at__isnull=True,
             ).select_related('business', 'customer', 'created_by')
 
-        # owner (and admin) — see all documents for their business
         return Document.objects.filter(
             business__owner=user,
             deleted_at__isnull=True,
@@ -62,30 +71,38 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = self._get_base_queryset()
+        params = self.request.query_params
 
-        # ── Filters ──────────────────────────────────────────────────────────
-        doc_type = self.request.query_params.get('document_type')
+        # One type, or several separated by commas: ?document_type=sales_invoice,proforma_invoice
+        doc_type = params.get('document_type')
         if doc_type:
-            queryset = queryset.filter(document_type=doc_type)
+            types = [t.strip() for t in doc_type.split(',') if t.strip()]
+            if types:
+                queryset = queryset.filter(document_type__in=types)
 
-        doc_status = self.request.query_params.get('status')
+        doc_status = params.get('status')
         if doc_status:
             queryset = queryset.filter(status=doc_status)
 
-        customer_id = self.request.query_params.get('customer')
+        stock_status = params.get('stock_status')
+        if stock_status:
+            queryset = queryset.filter(stock_status=stock_status)
+
+        customer_id = params.get('customer')
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
 
-        return queryset
+        search = (params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(document_number__icontains=search) |
+                Q(customer_name__icontains=search) |
+                Q(supplier_name__icontains=search)
+            )
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        if not serializer.is_valid():
-            print("--- SERIALIZER VALIDATION ERROR ---")
-            print(serializer.errors)
-            print("-----------------------------------")
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        return super().create(request, *args, **kwargs)
+        # The id is the last key so rows that share a date and creation time
+        # keep a stable order from one page to the next.
+        return queryset.order_by('-document_date', '-created_at', '-id')
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -99,76 +116,103 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied('No active staff account found.')
             business = staff.business
         else:
-            business = Business.objects.get(owner=user)
+            business = Business.objects.filter(owner=user).first()
+            if business is None:
+                raise PermissionDenied('Create your business before creating documents.')
 
-        serializer.save(
-            business=business,
-            created_by=user,
-            
-        )
+        Business.objects.select_for_update().get(pk=business.pk)
+
+        # Sales and proforma invoices count toward the monthly limit, supplier
+        # orders do not. The check runs under the lock above and in the same
+        # transaction as the create, so the 6th invoice on Free cannot slip in.
+        if serializer.validated_data.get('document_type') in COUNTED_INVOICE_TYPES:
+            check_limit(business, INVOICES)
+
+        serializer.save(business=business, created_by=user)
 
     def perform_destroy(self, instance):
-        instance.soft_delete()
+        if self.request.user != instance.business.owner:
+            raise PermissionDenied('Only the business owner is authorized to delete documents.')
+        payment_services.soft_delete_document(document_id=instance.id, business=instance.business)
 
-    # ── Custom actions ────────────────────────────────────────────────────────
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
 
-   
+        # Re-fetch so totals, stock_status and items reflect the saved state,
+        # and respond with the full read serializer instead of the write one.
+        fresh = self.get_object()
+        return Response(DocumentSerializer(fresh, context=self.get_serializer_context()).data)
+
+    # Custom actions
 
     @action(detail=True, methods=['post'], url_path='deliver')
     def deliver(self, request, pk=None):
         doc = self.get_object()
-        if doc.status !=  Document.Status.DRAFT:
+        if doc.status != Document.Status.DRAFT:
             return Response(
                 {'error': 'Document cannot be marked delivered from its current status.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         doc.mark_delivered()
         return Response(DocumentSerializer(doc).data)
-    
+
     @action(detail=True, methods=['get'], url_path='clone')
     def clone(self, request, pk=None):
-        """
-        GET /api/documents/{uuid}/clone/
-        Returns an editable 'template' based on an existing document.
-        """
+        """Returns an editable template based on an existing document."""
         original_doc = self.get_object()
-        
-        # 1. Fetch related items
         items = original_doc.items.all()
-        
-        # 2. Serialize current document
-        serializer = DocumentSerializer(original_doc)
-        data = serializer.data.copy()
-        
-        # 3. Strip fields that shouldn't be copied
-        # We remove fields that identify the old transaction
-        fields_to_remove = [
-            'id', 'document_number', 'status', 'created_at', 
-            'updated_at', 'sync_status', 'paid_at', 'delivered_at'
-        ]
-        for field in fields_to_remove:
+
+        data = dict(DocumentSerializer(original_doc).data)
+        for field in [
+            'id', 'document_number', 'status', 'created_at', 'updated_at', 'sync_status',
+            'paid_at', 'delivered_at', 'amount_paid', 'returned_credit', 'balance_due',
+            'stock_status', 'stock_deducted_at', 'is_delivered', 'deleted_at',
+        ]:
             data.pop(field, None)
-            
-        # 4. Include items in the response so the frontend 
-        # can pre-fill the line items list
+
         data['items'] = [
             {
                 'product': item.product.id if item.product else None,
                 'description': item.description,
                 'quantity': item.quantity,
                 'unit_price': item.unit_price,
-                'total': item.total
+                'total': item.total,
             } for item in items
         ]
-        
         return Response(data)
-
 
     @action(detail=True, methods=['post'], url_path='mark-paid')
     def mark_paid(self, request, pk=None):
         doc = self.get_object()
-        doc.mark_paid()
-        return Response(DocumentSerializer(doc).data)
+        body = MarkPaidSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        updated = payment_services.mark_invoice_paid(
+            document_id=doc.id, business=doc.business, user=request.user,
+            method=body.validated_data['method'], reference=body.validated_data['reference'],
+        )
+        return Response(DocumentSerializer(updated).data)
+
+    @action(detail=True, methods=['post'], url_path='mark-unpaid')
+    def mark_unpaid(self, request, pk=None):
+        """
+        POST /api/documents/{id}/mark-unpaid/
+        Body: {"deduct_stock": true}  (optional)
+        Moves a draft sales invoice to unpaid and adds it to the customer's
+        outstanding balance. All tracked items must be deducted from stock
+        first; deduct_stock=true does that in the same atomic step.
+        """
+        doc = self.get_object()
+        body = MarkUnpaidSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        updated = payment_services.mark_invoice_unpaid(
+            document_id=doc.id, business=doc.business, user=request.user,
+            deduct_stock=body.validated_data['deduct_stock'],
+        )
+        return Response(DocumentSerializer(updated).data)
 
     @action(detail=True, methods=['post'], url_path='soft-delete')
     def soft_delete(self, request, pk=None):
@@ -176,105 +220,43 @@ class DocumentViewSet(viewsets.ModelViewSet):
         if request.user != doc.business.owner:
             return Response(
                 {'error': 'Only the business owner is authorized to delete documents.'},
-                status=status.HTTP_403_FORBIDDEN
+                status=status.HTTP_403_FORBIDDEN,
             )
-        doc.soft_delete()
+        payment_services.soft_delete_document(document_id=doc.id, business=doc.business)
         return Response({'status': 'Document deleted', 'id': str(doc.id)})
 
     @action(detail=True, methods=['post'], url_path='deduct-inventory')
-    @transaction.atomic
     def deduct_inventory(self, request, pk=None):
         """
-        Manually deduct stock for a sales invoice.
+        Deduct stock for a sales invoice. Each item tracks how much has been
+        deducted, so the same quantity can never be deducted twice.
 
         Body (choose one):
           { "subtract_all": true }
           { "items": [{"item_id": "<uuid>", "quantity": 5}] }
         """
         doc = self.get_object()
-        if doc.document_type != Document.DocumentType.SALES_INVOICE:
+        if doc.status == Document.Status.DRAFT:
             return Response(
-                {'error': 'deduct-inventory is only valid for sales invoices.'},
+                {'error': 'Stock can only be deducted once the invoice is unpaid or paid.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        subtract_all = request.data.get('subtract_all', False)
-        items_payload = request.data.get('items', [])
-
-        if not subtract_all and not items_payload:
-            return Response(
-                {'error': 'Provide either subtract_all=true or a non-empty items list.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Dropped select_related('product') here — we now fetch the
-        # authoritative, locked Product rows separately below instead of
-        # trusting these possibly-stale related objects.
-        tracked = doc.items.filter(product__isnull=False)
-
-        if subtract_all:
-            targets_raw = [(item, item.quantity) for item in tracked]
-        else:
-            item_map = {str(item.id): item for item in tracked}
-            targets_raw = []
-            for entry in items_payload:
-                item_id = str(entry.get('item_id', ''))
-                try:
-                    qty = Decimal(str(entry.get('quantity', 0)))
-                except Exception:
-                    return Response(
-                        {'error': f'Invalid quantity for item {item_id}.'},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                if item_id not in item_map:
-                    return Response(
-                        {'error': f'Item {item_id} not found on this document.'},
-                        status=status.HTTP_404_NOT_FOUND,
-                    )
-                targets_raw.append((item_map[item_id], qty))
-
-        # Lock the actual Product rows for the rest of this transaction so
-        # two overlapping deduct-inventory calls touching the same product
-        # can't both read a stale quantity_on_hand and both pass validation.
-        product_ids = [item.product_id for item, _ in targets_raw]
-        locked_products = {
-            p.id: p for p in Product.objects.select_for_update().filter(id__in=product_ids)
-        }
-        targets = [(item, qty, locked_products[item.product_id]) for item, qty in targets_raw]
-
-        # Validate stock before touching anything
-        for item, qty, product in targets:
-            if product.quantity_on_hand < qty:
-                return Response(
-                    {
-                        'error': (
-                            f"Insufficient stock for '{product.name}'. "
-                            f"Available: {product.quantity_on_hand}, "
-                            f"Requested: {qty}."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        for item, qty, product in targets:
-            product.quantity_on_hand -= qty
-            product.save(update_fields=['quantity_on_hand', 'updated_at'])
-            InventoryTransaction.objects.create(
-                business=doc.business,
-                product=product,
-                quantity_change=-qty,
-                transaction_type=InventoryTransaction.TransactionType.SALES_CONFIRMED,
-                reference_document_id=doc.id,
-                initiated_by=request.user,
-            )
-
-        return Response({'status': 'Stock deducted.'}, status=status.HTTP_200_OK)
-
+        updated = document_services.deduct_stock(
+            document_id=doc.id, business=doc.business, user=request.user,
+            items=request.data.get('items'),
+            subtract_all=request.data.get('subtract_all') is True,
+        )
+        return Response(
+            {'status': 'Stock deducted.', 'stock_status': updated.stock_status},
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=['post'], url_path='add-to-inventory')
     @transaction.atomic
     def add_to_inventory(self, request, pk=None):
         """Add all line items to inventory for a purchase invoice."""
+        from inventory.models import InventoryTransaction
+
         doc = self.get_object()
         if doc.document_type != Document.DocumentType.PURCHASE_INVOICE:
             return Response(

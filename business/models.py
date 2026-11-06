@@ -1,7 +1,13 @@
+# business/models.py
 import uuid
+
 from django.conf import settings
-from django.db import models
 from django.core.exceptions import ValidationError
+from django.db import models
+
+from billing.plans import ALL_TEMPLATE_IDS, DEFAULT_TEMPLATE_ID
+
+TEMPLATE_CHOICES = [(template_id, template_id.capitalize()) for template_id in ALL_TEMPLATE_IDS]
 
 
 class SyncStatus(models.TextChoices):
@@ -12,17 +18,16 @@ class SyncStatus(models.TextChoices):
     DELETED = 'deleted', 'Deleted'
 
 
-
 class Business(models.Model):
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     owner = models.OneToOneField(
-        settings.AUTH_USER_MODEL, 
+        settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='business'
     )
-        
+
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     address_one = models.CharField(max_length=255)
@@ -30,43 +35,47 @@ class Business(models.Model):
     phone = models.CharField(max_length=20)
     email = models.EmailField()
     registration_number = models.CharField(max_length=100, null=True, blank=True)
-    
+
     # Store URL for the logo
     logo_url = models.URLField(null=True, blank=True)
-    
+
     currency = models.CharField(max_length=10, default="₦")
     tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     tax_enabled = models.BooleanField(default=False)
-    
-    selected_template_id = models.CharField(max_length=100, null=True, blank=True)
+
+    # Matches the frontend type: 'modern' | 'classic' | 'minimal' | 'professional'.
+    # The Free plan may only use the default, see billing/plans.py.
+    selected_template_id = models.CharField(
+        max_length=100, null=True, blank=True,
+        choices=TEMPLATE_CHOICES, default=DEFAULT_TEMPLATE_ID,
+    )
     onboarding_complete = models.BooleanField(default=False)
-    
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+
     motto = models.CharField(max_length=255, null=True, blank=True)
     signature_type = models.CharField(
-        choices=[("none","none"),("text","text"),("image","image")], default="none"
+        choices=[("none", "none"), ("text", "text"), ("image", "image")], default="none"
     )
     brand_color_one = models.CharField(max_length=8, default="#ca3a5e")
     brand_color_two = models.CharField(max_length=8, default="#A7A3A3")
     signature_text = models.CharField(max_length=255, blank=True, null=True)
     signature_url = models.URLField(blank=True, null=True)
-    
-    
+
     server_id = models.IntegerField(null=True, blank=True)
-    
+
     sync_status = models.CharField(
         max_length=20,
         choices=SyncStatus.choices,
         default=SyncStatus.PENDING)
-    
+
     def clean(self):
         # ALL core logic here
         if self.signature_type == 'none':
             self.signature_text = ''
             self.signature_url = ''
-        
+
         if self.signature_type == 'text' and not self.signature_text:
             raise ValidationError({'signature_text': 'Text signature is required'})
 
@@ -74,10 +83,8 @@ class Business(models.Model):
             raise ValidationError({'signature_url': 'Signature image is required'})
 
     def save(self, *args, **kwargs):
-        self.full_clean() # Triggers clean()
+        self.full_clean()  # Triggers clean()
         super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
-
-

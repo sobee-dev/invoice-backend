@@ -87,6 +87,7 @@ INSTALLED_APPS = [
     "products",
     "customers",
     "documents",
+    "payments",
     "inventory",
     "reports",
     "staff",
@@ -103,11 +104,31 @@ RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "BillBuzz <noreply@yourdomain
 # settings.py
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY')
 PAYSTACK_PUBLIC_KEY = os.getenv('PAYSTACK_PUBLIC_KEY')  # mobile/web checkout page may need this too
+
+def _paystack_plan_codes(tier):
+    t = tier.upper()
+    return {
+        # Env names: PAYSTACK_PLAN_CODE_{BUSINESS|ENTERPRISE}_{MONTHLY|BIANNUALLY|ANNUALLY}.
+        # The old single variable still works as the monthly code.
+        'monthly':    os.getenv(f'PAYSTACK_PLAN_CODE_{t}_MONTHLY') or os.getenv(f'PAYSTACK_PLAN_CODE_{t}', ''),
+        'biannually': os.getenv(f'PAYSTACK_PLAN_CODE_{t}_BIANNUALLY', ''),
+        'annually':   os.getenv(f'PAYSTACK_PLAN_CODE_{t}_ANNUALLY', ''),
+    }
+
 PAYSTACK_PLAN_CODES = {
-    'basic': os.getenv('PAYSTACK_PLAN_CODE_BASIC', ''),
-    'pro':   os.getenv('PAYSTACK_PLAN_CODE_PRO', ''),
+    'business':   _paystack_plan_codes('business'),
+    'enterprise': _paystack_plan_codes('enterprise'),
 }
 
+
+# Which payment provider billing/services.py uses. Only 'paystack' exists today.
+BILLING_PROVIDER = os.getenv('BILLING_PROVIDER', 'paystack')
+
+# Channels offered for one-off purchases. Card payments use recurring plans instead.
+BILLING_ONE_OFF_CHANNELS = ['bank_transfer', 'ussd']
+
+# Where Paystack sends the owner after paying. The billing page reads ?reference= and finishes the job.
+BILLING_SUCCESS_URL = os.getenv('BILLING_SUCCESS_URL', f"{FRONTEND_URL}/billing")
 
 BILLING_REMINDERS_ENABLED = os.getenv("BILLING_REMINDERS_ENABLED", "False") == "True"
 
@@ -153,6 +174,7 @@ CORS_ALLOW_HEADERS = [
     "content-type",
     "authorization",
     "x-csrftoken",
+    "x-client",
     "accept",
     "accept-language",
     "cookie",
@@ -184,22 +206,26 @@ REST_FRAMEWORK = {
         "password_reset": "5/hour",
     },
     
-    'DEFAULT_PERMISSION_CLASSES': [
+        'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
         'accounts.permissions.BusinessActivePermission',
+        'accounts.permissions.StaffWithinPlanPermission',
     ],
 }
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": ( timedelta(minutes=60) if IS_PROD else timedelta(minutes=30)
-    ),
-    "REFRESH_TOKEN_LIFETIME": ( timedelta(hours=10) if IS_PROD else timedelta(minutes=60)
-    ),
+    "ACCESS_TOKEN_LIFETIME": (timedelta(minutes=60) if IS_PROD else timedelta(minutes=30)),
+    "REFRESH_TOKEN_LIFETIME": (timedelta(hours=10) if IS_PROD else timedelta(minutes=60)),
     "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": True, 
+    "BLACKLIST_AFTER_ROTATION": True,
+
+    # Web refresh cookie. Do not add a plain "AUTH_COOKIE" key here.
+    "AUTH_REFRESH_COOKIE": "refresh_token",
+    "AUTH_COOKIE_PATH": "/api/users/",
     "AUTH_COOKIE_SECURE": IS_PROD,   # True in production (HTTPS), False locally
-    "AUTH_COOKIE_HTTP_ONLY": False,
+    "AUTH_COOKIE_HTTP_ONLY": True,
+    "AUTH_COOKIE_SAMESITE": "Lax",   # billbuzz.ng and app.billbuzz.ng are same-site
 }
 
 # ── Authentication ────────────────────────────────────────────────────────────

@@ -1,29 +1,30 @@
 # accounts/authenticate.py
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from django.conf import settings
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+
 
 class CookieJWTAuthentication(JWTAuthentication):
-    def authenticate(self, request):
-        # 1. Look for the cookie name in settings
-        cookie_name = settings.SIMPLE_JWT.get('AUTH_COOKIE', 'access')
-        raw_token = request.COOKIES.get(cookie_name)
-        
-        # 2. Hybrid Support: Check the 'Authorization' header if the cookie is missing
-        # This is helpful for debugging via Postman or Insomnia
-        if not raw_token:
-            header = self.get_header(request)
-            if header:
-                raw_token = self.get_raw_token(header)
+    """
+    Name kept so REST_FRAMEWORK settings do not change, but it now reads the
+    access token from the Authorization header only. Web keeps the access
+    token in memory and the refresh token in an httpOnly cookie that is
+    only ever sent to /api/users/, so there is no access cookie to read.
+    """
 
-        # 3. If still no token, return None (Standard DRF behavior)
+    def authenticate(self, request):
+        header = self.get_header(request)
+        if header is None:
+            return None
+
+        raw_token = self.get_raw_token(header)
         if raw_token is None:
             return None
 
-        # 4. Use a try/except block to catch expired or malformed tokens
         try:
             validated_token = self.get_validated_token(raw_token)
             return self.get_user(validated_token), validated_token
-        except:
-            # If token is invalid, returning None allows the 'PermissionDenied' 
-            # to be handled gracefully by the View's permission_classes
+        except (InvalidToken, TokenError, AuthenticationFailed):
+            # Expired, malformed, or inactive user: fall through to a 401
+            # from the permission classes so the client can try a refresh.
             return None

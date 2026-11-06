@@ -1,40 +1,36 @@
+# customers/views.py
 from decimal import Decimal
 
-from rest_framework import viewsets, status, permissions
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.pagination import CursorPagination
-
-
-from billing.permissions import HasActiveSubscription
-from business.models import Business
-from business.utils import get_user_business
-from .models import Customer
-from .serializers import CustomerSerializer, CustomerListSerializer
-from django.db.models import Q, Sum, Count, DecimalField, Value
+from django.db.models import Count, DecimalField, Q, Sum, Value
 from django.db.models.functions import Coalesce
+from django.utils import timezone
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.response import Response
 
+from accounts.permissions import BusinessActivePermission, StaffWithinPlanPermission
+from business.utils import get_user_business
+from receipt_backend_api.pagination import StandardPagination
+from .models import Customer
+from .serializers import CustomerListSerializer, CustomerSerializer
 
-class CustomerCursorPagination(CursorPagination):
-    page_size = 20
-    ordering = 'full_name' 
-    cursor_query_param = 'cursor'
+# ?sort=recent|az|za. The id is always the last key so two rows with the same
+# name or timestamp keep a stable order from one page to the next.
+SORTS = {
+    'recent': ('-created_at', '-id'),
+    'az': ('full_name', 'id'),
+    'za': ('-full_name', '-id'),
+}
+DEFAULT_SORT = 'az'
 
 
 class CustomerViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
-    pagination_class = CustomerCursorPagination
+    permission_classes = [
+        permissions.IsAuthenticated, BusinessActivePermission, StaffWithinPlanPermission,
+    ]
+    pagination_class = StandardPagination
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
-    
-    
-    
-    WRITE_ACTIONS = {'create', 'update', 'partial_update', 'deactivate', 'reactivate'}
-
-    def get_permissions(self):
-        if self.action in self.WRITE_ACTIONS:
-            return [permissions.IsAuthenticated(), HasActiveSubscription()]
-        return [permissions.IsAuthenticated()]
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -56,16 +52,16 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if status_filter in ('active', 'inactive'):
             queryset = queryset.filter(status=status_filter)
 
-        search = self.request.query_params.get('search')
+        search = (self.request.query_params.get('search') or '').strip()
         if search:
             queryset = queryset.filter(
                 Q(full_name__icontains=search) |
                 Q(email__icontains=search) |
                 Q(phone__icontains=search)
             )
-        return queryset
-    
-    
+
+        sort = self.request.query_params.get('sort', DEFAULT_SORT)
+        return queryset.order_by(*SORTS.get(sort, SORTS[DEFAULT_SORT]))
 
     def perform_create(self, serializer):
         business = get_user_business(self.request.user)
@@ -80,7 +76,6 @@ class CustomerViewSet(viewsets.ModelViewSet):
         customer.save(update_fields=['status'])
         return Response(CustomerSerializer(customer).data, status=status.HTTP_200_OK)
 
-
     @action(detail=True, methods=['post'], url_path='reactivate')
     def reactivate(self, request, pk=None):
         customer = self.get_object()
@@ -88,12 +83,32 @@ class CustomerViewSet(viewsets.ModelViewSet):
         customer.save(update_fields=['status'])
         return Response(CustomerSerializer(customer).data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['get'], url_path='counts')
+    def counts(self, request):
+        """
+        GET /api/customers/counts/
+        Totals for the header cards, so the client never has to load every
+        customer just to count them.
+        """
+        business = get_user_business(request.user)
+        if business is None:
+            return Response({'error': 'No business associated with this account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        month_start = timezone.localtime().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        result = Customer.objects.filter(business=business).aggregate(
+            total=Count('id'),
+            active=Count('id', filter=Q(status='active')),
+            inactive=Count('id', filter=Q(status='inactive')),
+            new_this_month=Count('id', filter=Q(created_at__gte=month_start)),
+        )
+        return Response(result)
+
     @action(detail=False, methods=['get'], url_path='analytics')
     def analytics(self, request):
         business = get_user_business(request.user)
         if business is None:
             return Response({'error': 'No business associated with this account.'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         base = Customer.objects.filter(business=business).annotate(
             ltv=Coalesce(
                 Sum('documents__grand_total', filter=Q(documents__status='paid')),

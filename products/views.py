@@ -1,24 +1,34 @@
-from rest_framework import viewsets, status, permissions
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.pagination import CursorPagination
-from django.db.models import Q, DecimalField, Max, OuterRef, Subquery, Sum, F, Case, When, Value, BooleanField
-from django.db.models.functions import Coalesce
-from django.db import transaction
-from billing.permissions import HasActiveSubscription
-from business.models import Business
-from business.utils import get_user_business
-from documents.models import Document, DocumentItem
-from .models import Product
-from .serializers import BulkDeductSerializer, ProductSerializer, ProductListSerializer, ProductUpdateSerializer, StockAdjustmentSerializer
-from .services import check_and_notify_stock_level
-from rest_framework.exceptions import ValidationError as DRFValidationError
-from inventory.models import InventoryTransaction
+# products/views.py
+import hashlib
 import re
 import time
-import hashlib
+
 import requests
 from django.conf import settings
+from django.db import transaction
+from django.db.models import (
+    BooleanField, Case, Count, DecimalField, F, Max, OuterRef, Q, Subquery, Sum, Value, When,
+)
+from django.db.models.functions import Coalesce
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.response import Response
+
+from accounts.permissions import BusinessActivePermission, StaffWithinPlanPermission
+from billing.plans import PRODUCTS, check_limit
+from business.utils import get_user_business
+from documents.exceptions import DomainError
+from documents.models import Document, DocumentItem
+from inventory.models import InventoryTransaction
+from receipt_backend_api.pagination import StandardPagination
+
+from .models import Product
+from .serializers import (
+    BulkDeductSerializer, ProductListSerializer, ProductSerializer,
+    ProductUpdateSerializer, StockAdjustmentSerializer,
+)
+from .services import check_and_notify_stock_level, locked_product_info, visible_products
 
 _PENDING_TOKEN_PATTERN = re.compile(r'^[a-zA-Z0-9\-]{1,64}$')
 
@@ -48,23 +58,43 @@ def _cloudinary_rename(from_public_id, to_public_id):
     )
     return resp.json()
 
-class ProductCursorPagination(CursorPagination):
-    page_size = 20
-    ordering = 'name'
-    cursor_query_param = 'cursor'
+
+# Stock filters. One definition feeds both the list filter and the counts, so a
+# badge number always matches what its tab shows.
+#   ok        active, something available, not at or under its reorder level
+#   low       active, something available, at or under its reorder level
+#   out       active, nothing available
+#   inactive  switched off
+#   active    active and at least one unit on hand (the mobile "Active" tab)
+STOCK_FILTERS = {
+    'ok': Q(is_active=True, available_stock__gt=0, low_stock_flag=False),
+    'low': Q(is_active=True, available_stock__gt=0, low_stock_flag=True),
+    'out': Q(is_active=True, available_stock__lte=0),
+    'inactive': Q(is_active=False),
+    'active': Q(is_active=True, quantity_on_hand__gt=0),
+}
+
+
+def _with_stock_annotations(queryset):
+    return queryset.annotate(
+        available_stock=F('quantity_on_hand') - F('quantity_reserved'),
+        low_stock_flag=Case(
+            When(
+                quantity_on_hand__lte=F('quantity_reserved') + F('reorder_level'),
+                then=Value(True),
+            ),
+            default=Value(False),
+            output_field=BooleanField(),
+        ),
+    )
 
 
 class ProductViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
-    pagination_class = ProductCursorPagination
-    http_method_names = ['get', 'post', 'patch', 'head', 'options']
-    
-    WRITE_ACTIONS = {'create', 'update', 'partial_update', 'deactivate', 'adjust_stock', 'bulk_deduct'}
-
-    def get_permissions(self):
-        if self.action in self.WRITE_ACTIONS:
-            return [permissions.IsAuthenticated(), HasActiveSubscription()]
-        return [permissions.IsAuthenticated()]
+    permission_classes = [
+        permissions.IsAuthenticated, BusinessActivePermission, StaffWithinPlanPermission,
+    ]
+    pagination_class = StandardPagination
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -72,27 +102,30 @@ class ProductViewSet(viewsets.ModelViewSet):
         if self.action in ['update', 'partial_update']:
             return ProductUpdateSerializer
         return ProductSerializer
-        
 
     def get_queryset(self):
-        user = self.request.user
-        business = get_user_business(user)
+        business = get_user_business(self.request.user)
         if business is None:
             return Product.objects.none()
 
-        queryset = Product.objects.filter(business=business).select_related('business')
-        
-        # 2.  Filters
+        # visible_products hides active products outside the plan's window.
+        queryset = visible_products(business).select_related('business')
+
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
 
-        search = self.request.query_params.get('search')
+        search = (self.request.query_params.get('search') or '').strip()
         if search:
             queryset = queryset.filter(
                 Q(name__icontains=search) | Q(sku__icontains=search)
             )
 
+        queryset = _with_stock_annotations(queryset)
+
+        stock = self.request.query_params.get('stock')
+        if stock in STOCK_FILTERS:
+            queryset = queryset.filter(STOCK_FILTERS[stock])
 
         sold_subquery = DocumentItem.objects.filter(
             product=OuterRef('pk'),
@@ -101,36 +134,33 @@ class ProductViewSet(viewsets.ModelViewSet):
             total=Sum('quantity')
         ).values('total')
 
-        #3. Annotations
         return queryset.annotate(
             total_sold_qty=Coalesce(
                 Subquery(sold_subquery, output_field=DecimalField(max_digits=10, decimal_places=3)),
                 Value(0),
                 output_field=DecimalField(max_digits=10, decimal_places=3),
             ),
-            available_stock=F('quantity_on_hand') - F('quantity_reserved'),
-            low_stock_flag=Case(
-                When(
-                    quantity_on_hand__lte=F('quantity_reserved') + F('reorder_level'),
-                    then=Value(True)
-                ),
-                default=Value(False),
-                output_field=BooleanField()
-            )
-        )
+        ).order_by('name', 'id')
 
     def perform_create(self, serializer):
         business = get_user_business(self.request.user)
         if business is None:
             raise DRFValidationError({'detail': 'No business associated with this account.'})
-        sku = serializer.validated_data.get('sku')
-        if sku and Product.objects.filter(business=business, sku=sku).exists():
-            raise DRFValidationError({'sku': 'A product with this SKU already exists.'})
-        product = serializer.save(business=business)
+
+        # The cap check and the insert share one transaction and one business
+        # row lock, so two simultaneous creates cannot both pass.
+        with transaction.atomic():
+            if serializer.validated_data.get('is_active', True):
+                check_limit(business, PRODUCTS)
+            sku = serializer.validated_data.get('sku')
+            if sku and Product.objects.filter(business=business, sku=sku).exists():
+                raise DRFValidationError({'sku': 'A product with this SKU already exists.'})
+            product = serializer.save(business=business)
 
         # If the client uploaded an image before the product existed (new-
-        # product flow), it's sitting under a pending/ token path — move it
-        # to the product's permanent slot now that we have a real ID.
+        # product flow), it's sitting under a pending/ token path. Move it
+        # to the product's permanent slot now that we have a real ID. This is a
+        # network call, so it stays outside the transaction.
         pending_token = self.request.data.get('pending_image_token')
         if pending_token and _PENDING_TOKEN_PATTERN.match(pending_token):
             from_public_id = f"product-images/pending_{business.id}_{pending_token}"
@@ -139,7 +169,50 @@ class ProductViewSet(viewsets.ModelViewSet):
             if result.get('secure_url'):
                 product.image_url = result['secure_url']
                 product.save(update_fields=['image_url', 'updated_at'])
-        
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        product = serializer.instance
+        # Switching a product back on adds to the active count, so it is
+        # checked like a new product.
+        if serializer.validated_data.get('is_active') is True and not product.is_active:
+            check_limit(product.business, PRODUCTS)
+        serializer.save()
+
+    def destroy(self, request, *args, **kwargs):
+        """
+        DELETE /api/products/{id}/  owner only.
+        Removes the product and its Cloudinary image. Refused while the product
+        is on a draft or unpaid invoice, because deleting it would break stock
+        deduction and returns on those invoices. Deactivate it instead.
+        Its stock history is removed with it.
+        """
+        if request.user.role != 'owner':
+            return Response(
+                {'error': 'Only business owners can delete products.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        product = self.get_object()
+
+        on_open_invoice = DocumentItem.objects.filter(
+            product=product,
+            document__status__in=[Document.Status.DRAFT, Document.Status.UNPAID],
+        ).exists()
+        if on_open_invoice:
+            raise DomainError(
+                'This product is on a draft or unpaid invoice. Deactivate it instead, '
+                'or remove it from those invoices first.',
+                'product_in_use', 409,
+            )
+
+        image_url = product.image_url
+        with transaction.atomic():
+            product.delete()
+            if image_url:
+                from business.services import delete_cloudinary_asset
+                # After commit, so a rolled back delete never loses the image.
+                transaction.on_commit(lambda: delete_cloudinary_asset(image_url))
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'], url_path='deactivate')
     def deactivate(self, request, pk=None):
@@ -155,33 +228,48 @@ class ProductViewSet(viewsets.ModelViewSet):
             {'status': 'Product deactivated', 'id': str(product.id)},
             status=status.HTTP_200_OK
         )
-        
+
+    @action(detail=False, methods=['get'], url_path='counts')
+    def counts(self, request):
+        """
+        GET /api/products/counts/
+        One number per stock filter tab: all, ok, low, out, inactive. Ignores
+        the search box on purpose, so the badges describe the whole catalogue.
+        """
+        business = get_user_business(request.user)
+        if business is None:
+            return Response({'error': 'No business associated with this account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        base = _with_stock_annotations(visible_products(business))
+        result = base.aggregate(
+            all=Count('id'),
+            ok=Count('id', filter=STOCK_FILTERS['ok']),
+            low=Count('id', filter=STOCK_FILTERS['low']),
+            out=Count('id', filter=STOCK_FILTERS['out']),
+            inactive=Count('id', filter=STOCK_FILTERS['inactive']),
+        )
+        return Response(result)
+
     @action(detail=False, methods=['get'], url_path='stats')
     def stats(self, request):
         business = get_user_business(request.user)
-        
+
         if business is None:
             return Response({'error': 'No business associated with this account.'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        
-        # Aggregate totals
-        stats = Product.objects.filter(business=business).aggregate(
+
+        products = visible_products(business)
+        stats = products.aggregate(
             total_stock=Sum('quantity_on_hand'),
             max_stock=Max('quantity_on_hand')
         )
-        
-        # Find product with max stock
-        highest_stock_product = Product.objects.filter(
-            business=business
-        ).order_by('-quantity_on_hand').first()
-        
+        highest_stock_product = products.order_by('-quantity_on_hand').first()
+
         return Response({
             'total_stock_value': stats['total_stock'] or 0,
             'highest_stock_product': highest_stock_product.name if highest_stock_product else None,
             'highest_stock_count': highest_stock_product.quantity_on_hand if highest_stock_product else 0
         })
-        
-        
+
     @action(detail=True, methods=['post'], url_path='adjust-stock')
     @transaction.atomic
     def adjust_stock(self, request, pk=None):
@@ -234,9 +322,8 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'transaction_id': str(tx.id),
             },
             status=status.HTTP_200_OK,
-        )    
-        
-        
+        )
+
     @action(detail=False, methods=['post'], url_path='bulk-deduct')
     @transaction.atomic
     def bulk_deduct(self, request):
@@ -255,13 +342,12 @@ class ProductViewSet(viewsets.ModelViewSet):
         transaction_type=SALES_CONFIRMED) tagged with
         reference_document_id so it's traceable back to the invoice
         that triggered it. All items are validated before anything is
-        written — a single insufficient-stock item fails the whole
-        batch rather than leaving some products deducted and others not.
+        written: a single insufficient-stock item, or a product outside the
+        plan's window, fails the whole batch.
         """
         business = get_user_business(request.user)
         if business is None:
             return Response({'error': 'No business associated with this account.'}, status=status.HTTP_400_BAD_REQUEST)
-        
 
         serializer = BulkDeductSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -277,12 +363,20 @@ class ProductViewSet(viewsets.ModelViewSet):
                 id__in=product_ids, business=business
             )
         }
+        locked, locked_message = locked_product_info(business)
 
         errors = []
         for item in items:
             product = products.get(item['product_id'])
             if product is None:
                 errors.append({'product_id': str(item['product_id']), 'error': 'Product not found.'})
+                continue
+            if product.id in locked:
+                errors.append({
+                    'product_id': str(product.id),
+                    'error': locked_message,
+                    'code': 'product_outside_plan',
+                })
                 continue
             if product.quantity_on_hand - item['quantity'] < 0:
                 errors.append({

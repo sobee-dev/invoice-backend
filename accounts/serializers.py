@@ -3,6 +3,10 @@ from rest_framework import serializers
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 
+from accounts.terms import terms_fields
+from accounts.validators import reject_disposable_email
+
+from .google import GoogleAuthError, has_real_password, require_recent, user_info_from_proof
 from business.serializers import BusinessSerializer
 from business.utils import get_user_business
 from .models import AccountStatus, AccountStatusAudit, PasswordResetToken, User
@@ -18,6 +22,7 @@ class UserSerializer(serializers.ModelSerializer):
     """
     has_business = serializers.SerializerMethodField()
     full_name = serializers.SerializerMethodField()
+    has_password = serializers.SerializerMethodField()
     
     class Meta:
         model = User
@@ -34,6 +39,7 @@ class UserSerializer(serializers.ModelSerializer):
             'requires_password_change',
             'password_changed_at',
             'has_business',
+            'has_password',
             'is_active',
             'is_staff',
             'created_at',
@@ -46,6 +52,7 @@ class UserSerializer(serializers.ModelSerializer):
             'updated_at',
             'is_staff',
             'has_business',
+            'has_password',
             'requires_password_change',
             'password_changed_at',
         ]
@@ -53,6 +60,9 @@ class UserSerializer(serializers.ModelSerializer):
     def get_has_business(self, obj):
         return get_user_business(obj) is not None
 
+    def get_has_password(self, obj):
+        return has_real_password(obj)
+    
     def get_full_name(self, obj):
         """Get full name from first and last name"""
         name = f"{obj.first_name} {obj.last_name}".strip()
@@ -73,11 +83,20 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         max_length=128,
         style={'input_type': 'password'}
     )
+    accepted_terms = serializers.BooleanField(write_only=True)
 
     class Meta:
         model = User
-        fields = ['email', 'password', 'first_name', 'last_name']
+        fields = ['email', 'password', 'first_name', 'last_name', 'accepted_terms']
 
+    
+    def validate_accepted_terms(self, value):
+        if value is not True:
+            raise serializers.ValidationError(
+                "You must accept the Terms of Service and Privacy Policy."
+            )
+        return value
+    
     def validate_email(self, value):
         """Normalize email and check uniqueness"""
         value = value.lower()
@@ -95,8 +114,15 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         """Uses the Custom UserManager to ensure password hashing"""
-        return User.objects.create_user(**validated_data)
+        validated_data.pop('accepted_terms')
+        return User.objects.create_user(**validated_data, **terms_fields())
 
+    def validate_email(self, value):
+        value = value.lower()
+        reject_disposable_email(value)
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("A user with this email already exists")
+        return value
 
 # ============================================
 # 3. Update Serializer
@@ -340,15 +366,39 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         return user    
     
 class AccountDeletionRequestSerializer(serializers.Serializer):
-    """Owner-initiated deletion — requires password re-entry, reason optional."""
-    password = serializers.CharField(write_only=True)
+    """
+    Owner or staff initiated deletion. Accounts with a password confirm with
+    that password. Google only accounts confirm with a fresh Google sign in:
+    google_code from the web flow, or google_id_token from the mobile SDK.
+    Errors are lists so existing mobile code that reads field[0] keeps working.
+    """
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    google_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    google_id_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
     reason = serializers.CharField(required=False, allow_blank=True, max_length=1000)
 
-    def validate_password(self, value):
+    def validate(self, attrs):
         user = self.context['request'].user
-        if not user.check_password(value):
-            raise serializers.ValidationError("Incorrect password.")
-        return value
+
+        if has_real_password(user):
+            password = attrs.get('password', '')
+            if not password:
+                raise serializers.ValidationError({'password': ['Password is required.']})
+            if not user.check_password(password):
+                raise serializers.ValidationError({'password': ['Incorrect password.']})
+            return attrs
+
+        try:
+            info = user_info_from_proof(attrs.get('google_code'), attrs.get('google_id_token'))
+            require_recent(info)
+        except GoogleAuthError as e:
+            raise serializers.ValidationError({'google': [e.message]})
+
+        if info['email'] != user.email.lower():
+            raise serializers.ValidationError(
+                {'google': ['That Google account does not match this account.']}
+            )
+        return attrs
 
     def save(self):
         from .models import AccountStatus
@@ -357,6 +407,64 @@ class AccountDeletionRequestSerializer(serializers.Serializer):
             user=self.context['request'].user,
             new_status=AccountStatus.PENDING_DELETION,
             reason=self.validated_data.get('reason', ''),
+        )
+
+
+class CancelAccountDeletionSerializer(serializers.Serializer):
+    """
+    Self-service reactivation for an account still inside its grace period.
+    Deliberately doesn't use Django's authenticate(): ModelBackend refuses
+    inactive users outright, and a pending-deletion account is inactive by
+    design. Password accounts send email and password. Google accounts send a
+    fresh google_code or google_id_token, and the email comes from Google.
+    """
+    email = serializers.EmailField(required=False)
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    google_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    google_id_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
+
+    def _find_user(self, attrs):
+        google_code = attrs.get('google_code')
+        google_id_token = attrs.get('google_id_token')
+
+        if google_code or google_id_token:
+            try:
+                info = user_info_from_proof(google_code, google_id_token)
+                require_recent(info)
+            except GoogleAuthError as e:
+                raise serializers.ValidationError({'error': e.message})
+            user = User.objects.filter(email=info['email']).first()
+            if user is None:
+                raise serializers.ValidationError({'error': 'No account was found for that Google account.'})
+            return user
+
+        email = (attrs.get('email') or '').lower()
+        password = attrs.get('password', '')
+        if not email or not password:
+            raise serializers.ValidationError({'error': 'Email and password are required.'})
+
+        user = User.objects.filter(email=email).first()
+        if user is None or not user.check_password(password):
+            raise serializers.ValidationError({'error': 'Invalid email or password.'})
+        return user
+
+    def validate(self, attrs):
+        user = self._find_user(attrs)
+
+        if user.status != AccountStatus.PENDING_DELETION:
+            raise serializers.ValidationError({'error': 'This account is not scheduled for deletion.'})
+
+        if user.deletion_scheduled_for and user.deletion_scheduled_for <= timezone.now():
+            raise serializers.ValidationError({'error': 'The deletion grace period has already ended.'})
+
+        self.user = user
+        return attrs
+
+    def save(self):
+        from .services import set_account_status
+        return set_account_status(
+            user=self.user, new_status=AccountStatus.ACTIVE,
+            reason='Self-service reactivation before grace period ended.',
         )
 
 
@@ -372,42 +480,3 @@ class AccountStatusAuditSerializer(serializers.ModelSerializer):
         fields = ['id', 'user_id', 'email', 'from_status', 'to_status', 'reason', 'actor_email', 'created_at']
         read_only_fields = fields    
     
-class CancelAccountDeletionSerializer(serializers.Serializer):
-    """
-    Self-service reactivation for an account still inside its grace period.
-    Deliberately doesn't use Django's authenticate(): ModelBackend refuses
-    inactive users outright, and a pending-deletion account is inactive by
-    design — so the password is checked directly against the looked-up user.
-    """
-    email = serializers.EmailField()
-    password = serializers.CharField(write_only=True)
-
-    def validate(self, attrs):
-        from django.utils import timezone
-        from .models import AccountStatus
-
-        email = attrs['email'].lower()
-        try:
-            user = User.objects.get(email=email)
-        except User.DoesNotExist:
-            raise serializers.ValidationError({'error': 'Invalid email or password.'})
-
-        if not user.check_password(attrs['password']):
-            raise serializers.ValidationError({'error': 'Invalid email or password.'})
-
-        if user.status != AccountStatus.PENDING_DELETION:
-            raise serializers.ValidationError({'error': 'This account is not scheduled for deletion.'})
-
-        if user.deletion_scheduled_for and user.deletion_scheduled_for <= timezone.now():
-            raise serializers.ValidationError({'error': 'The deletion grace period has already ended.'})
-
-        self.user = user
-        return attrs
-
-    def save(self):
-        from .models import AccountStatus
-        from .services import set_account_status
-        return set_account_status(
-            user=self.user, new_status=AccountStatus.ACTIVE,
-            reason='Self-service reactivation before grace period ended.',
-        )       

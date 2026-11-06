@@ -6,10 +6,11 @@ from django.db import models
 class InventoryTransaction(models.Model):
 
     class TransactionType(models.TextChoices):
-       
+
         PURCHASE_RECEIVED = 'purchase_received', 'Purchase Received'
         ADJUSTMENT        = 'adjustment',        'Adjustment'
-        SALES_CONFIRMED   = 'sales_confirmed', 'Sales Confirmed'
+        SALES_CONFIRMED   = 'sales_confirmed',   'Sales Confirmed'
+        SALES_RETURN      = 'sales_return',      'Sales Return'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -47,4 +48,4 @@ class InventoryTransaction(models.Model):
 
     def __str__(self):
         direction = '+' if self.quantity_change >= 0 else ''
-        return f"{self.get_transaction_type_display()} {direction}{self.quantity_change} — {self.product}"
+        return f"{self.get_transaction_type_display()} {direction}{self.quantity_change} - {self.product}"

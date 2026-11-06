@@ -1,40 +1,34 @@
-from decimal import Decimal
-
-from rest_framework import viewsets, permissions, status
-from rest_framework.decorators import action, api_view, permission_classes
-
-from django.shortcuts import get_object_or_404
-from django.db.models import Sum
-from django.utils import timezone
-from billing.models import Subscription
-from billing.permissions import HasActiveSubscription
-from business.services import get_full_summary_data
-from staff.models import StaffMember
-from .models import Business, SyncStatus
-from .serializers import (
-    BusinessSerializer,
-    BusinessListSerializer,
-    BusinessCreateSerializer,
-    BusinessUpdateSerializer,
-    BusinessSyncSerializer,
-    BusinessOnboardingSerializer
-)
-
-# cloudinary uploads
-import re
-import time
+# business/views.py
 import hashlib
+import time
+
 import requests
 from django.conf import settings
-
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
+
+from accounts.permissions import BusinessActivePermission, StaffWithinPlanPermission
+from billing.services import ensure_subscription
+from business.services import get_full_summary_data
 from business.utils import get_user_business
+from staff.models import StaffMember
+from .models import Business
+from .serializers import (
+    BusinessCreateSerializer,
+    BusinessListSerializer,
+    BusinessOnboardingSerializer,
+    BusinessSerializer,
+    BusinessSyncSerializer,
+    BusinessUpdateSerializer,
+)
 
 ALLOWED_UPLOAD_FOLDERS = {'business-logos', 'business-signatures', 'product-images'}
 
-TRIAL_DAYS = 15
+_UPLOAD_PERMISSIONS = [permissions.IsAuthenticated, BusinessActivePermission, StaffWithinPlanPermission]
+
 
 def _build_public_id(folder, business_id, resource_id=None):
     """
@@ -43,8 +37,8 @@ def _build_public_id(folder, business_id, resource_id=None):
     can never disagree about what an asset is called. We always include
     the folder ourselves in the id rather than relying on Cloudinary's
     implicit folder-prepending, which behaves differently depending on
-    whether the product environment is in Dynamic or Fixed folder mode —
-    this way it doesn't matter which mode the account is in.
+    whether the product environment is in Dynamic or Fixed folder mode,
+    so it doesn't matter which mode the account is in.
 
     business-logos / business-signatures: one slot per business.
     product-images: one slot per (business, product) pair.
@@ -58,7 +52,7 @@ def _resolve_target(request, folder, resource_id=None):
     """
     Returns (business, public_id) this request is allowed to write to /
     remove, or (None, None) if the request isn't authorized for that
-    target. Product images always require an existing resource_id now —
+    target. Product images always require an existing resource_id now:
     uploads for not-yet-created products are staged locally on the client
     and only sent to Cloudinary once the product (and its id) exists, so
     there's no more "pending" namespace or cleanup job to maintain.
@@ -75,7 +69,7 @@ def _resolve_target(request, folder, resource_id=None):
             return None, None
         return business, _build_public_id(folder, business.id, resource_id)
 
-    # business-logos / business-signatures — owner-only, one slot per business
+    # business-logos / business-signatures: owner-only, one slot per business
     if request.user.role != 'owner':
         return None, None
     return business, _build_public_id(folder, business.id)
@@ -87,7 +81,7 @@ def _sign(params):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes(_UPLOAD_PERMISSIONS)
 def cloudinary_signature(request):
     folder = request.data.get('folder')
     if folder not in ALLOWED_UPLOAD_FOLDERS:
@@ -114,7 +108,7 @@ def cloudinary_signature(request):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes(_UPLOAD_PERMISSIONS)
 def cloudinary_remove(request):
     folder = request.data.get('folder')
     if folder not in ALLOWED_UPLOAD_FOLDERS:
@@ -170,23 +164,20 @@ def cloudinary_remove(request):
 
     return Response({'message': 'Removed.'})
 
+
 class BusinessViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for Business management with custom actions for 
+    ViewSet for Business management with custom actions for
     onboarding, synchronization, and profile management.
+
+    Nothing here is paywalled. Creating a business has to work before any
+    subscription exists, and a Free owner must always be able to edit their
+    business. Plan rules live in billing/plans.py.
     """
     queryset = Business.objects.all()
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def get_permissions(self):
-        # 'create' and the POST branch of 'me' both run before any Business
-        # row exists for this user. HasActiveSubscription needs an existing
-        # business to find a subscription on — gating either would permanently
-        # block onboarding for a brand-new signup. Only PATCH on 'me' (editing
-        # an existing business) is gated.
-        if self.action == 'manage_my_business' and self.request.method == 'PATCH':
-            return [permissions.IsAuthenticated(), HasActiveSubscription()]
-        return [permissions.IsAuthenticated()]
+    permission_classes = [
+        permissions.IsAuthenticated, BusinessActivePermission, StaffWithinPlanPermission,
+    ]
 
     def get_serializer_class(self):
         """
@@ -196,7 +187,7 @@ class BusinessViewSet(viewsets.ModelViewSet):
             return BusinessListSerializer
         elif self.action == 'create':
             return BusinessCreateSerializer
-        elif self.action in ['update', 'partial_update','manage_my_business']:
+        elif self.action in ['update', 'partial_update', 'manage_my_business']:
             return BusinessUpdateSerializer
         elif self.action == 'sync':
             return BusinessSyncSerializer
@@ -212,13 +203,12 @@ class BusinessViewSet(viewsets.ModelViewSet):
         if self.request.user.is_staff:
             return queryset
         return queryset.filter(owner=self.request.user)
-    
+
+    @transaction.atomic
     def perform_create(self, serializer):
         business = serializer.save(owner=self.request.user)
-        Subscription.objects.get_or_create(
-            business=business,
-            defaults={'trial_ends_at': timezone.now() + timezone.timedelta(days=TRIAL_DAYS)},
-        )    
+        # Every new business starts its 15 day trial (Business limits) here.
+        ensure_subscription(business)
 
     @action(detail=False, methods=['get', 'patch', 'post'], url_path='me')
     def manage_my_business(self, request):
@@ -242,11 +232,9 @@ class BusinessViewSet(viewsets.ModelViewSet):
                 return Response({"detail": "Business already exists."}, status=status.HTTP_400_BAD_REQUEST)
             serializer = BusinessCreateSerializer(data=request.data, context={'request': request})
             serializer.is_valid(raise_exception=True)
-            business = serializer.save(owner=request.user)
-            Subscription.objects.get_or_create(
-                business=business,
-                defaults={'trial_ends_at': timezone.now() + timezone.timedelta(days=TRIAL_DAYS)},
-            )
+            with transaction.atomic():
+                business = serializer.save(owner=request.user)
+                ensure_subscription(business)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         if request.method == 'PATCH':
@@ -261,8 +249,7 @@ class BusinessViewSet(viewsets.ModelViewSet):
             serializer.is_valid(raise_exception=True)
             serializer.save()
             return Response(serializer.data)
-        
-            
+
     @action(detail=True, methods=['post'], url_path='sync')
     def sync(self, request, pk=None):
         """
@@ -285,7 +272,7 @@ class BusinessViewSet(viewsets.ModelViewSet):
         # Force the onboarding_complete flag to True in the request data
         data = request.data.copy()
         data['onboarding_complete'] = True
-        
+
         serializer = self.get_serializer(business, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -293,22 +280,20 @@ class BusinessViewSet(viewsets.ModelViewSet):
             "status": "Onboarding successful",
             "business": BusinessSerializer(business).data
         })
-        
-        
+
     @action(detail=False, methods=['get'], url_path='summary-data')
     def summary_data(self, request):
-       
+
         business = get_object_or_404(self.get_queryset())
-        
+
         # Already built out all the responses in business.services
         data = get_full_summary_data(business)
         return Response(data)
-        
 
     @action(detail=False, methods=['get'])
     def sync_health(self, request):
         """Moved from DashboardViewSet"""
-        business = get_object_or_404(self.get_queryset)
+        business = get_object_or_404(self.get_queryset())
         return Response({
             "status": business.sync_status,
             "last_synced": business.updated_at,

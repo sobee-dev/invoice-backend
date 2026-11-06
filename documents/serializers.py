@@ -1,10 +1,24 @@
+# documents/serializers.py
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from rest_framework import serializers
 
+from business.utils import get_user_business
 from customers.services import get_or_create_customer
+from products.services import assert_items_within_plan, get_or_create_product
 from .models import Document, DocumentItem
-from products.services import get_or_create_product
+
+
+def _assert_customer_in_business(customer, business):
+    if customer is not None and customer.business_id != business.id:
+        raise serializers.ValidationError({'customer': 'This customer does not belong to your business.'})
+
+
+def _assert_product_in_business(product, business):
+    if product is not None and product.business_id != business.id:
+        raise serializers.ValidationError({'items': 'One of the products does not belong to your business.'})
 
 
 class DocumentUserSerializer(serializers.ModelSerializer):
@@ -29,14 +43,21 @@ class DocumentUserSerializer(serializers.ModelSerializer):
 class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     product_image_url = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = DocumentItem
-        fields = ['id', 'product', 'product_name', 'description', 'quantity', 'unit_price', 'total', 'product_image_url']
+        fields = [
+            'id', 'product', 'product_name', 'description', 'quantity', 'unit_price', 'total',
+            'product_image_url', 'quantity_deducted', 'quantity_returned',
+        ]
         extra_kwargs = {
             'product': {'required': False},
             'id': {'read_only': True},
             'total': {'read_only': True},
+            'quantity_deducted': {'read_only': True},
+            'quantity_returned': {'read_only': True},
+            'quantity': {'min_value': Decimal('0.001')},
+            'unit_price': {'min_value': Decimal('0')},
         }
 
     def get_product_image_url(self, obj):
@@ -51,17 +72,45 @@ class DocumentItemSerializer(serializers.ModelSerializer):
 
 
 class DocumentSerializer(serializers.ModelSerializer):
-    created_by = DocumentUserSerializer(read_only=True)  
+    created_by = DocumentUserSerializer(read_only=True)
     items = DocumentItemSerializer(many=True, required=False)
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model = Document
         fields = '__all__'
-        read_only_fields = ['id', 'business', 'created_by', 'created_at', 'updated_at', 'document_number']
+        # Status, money and stock fields are server-controlled. A client must
+        # never be able to create a document that is already "paid".
+        read_only_fields = [
+            'id', 'business', 'created_by', 'created_at', 'updated_at', 'document_number',
+            'status', 'subtotal', 'tax_amount', 'grand_total',
+            'amount_paid', 'returned_credit', 'paid_at',
+            'stock_status', 'stock_deducted_at',
+            'is_delivered', 'delivered_at', 'deleted_at',
+        ]
         validators = []
+        extra_kwargs = {
+            'discount': {'min_value': Decimal('0')},
+            'tax_rate': {'min_value': Decimal('0'), 'max_value': Decimal('1')},
+        }
+
+    def validate(self, attrs):
+        # A line that uses a product outside the plan's window is refused here,
+        # with the error attached to that line.
+        request = self.context.get('request')
+        business = get_user_business(request.user) if request else None
+        items = attrs.get('items')
+        if business is not None and items:
+            assert_items_within_plan(business, items)
+        return attrs
 
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
+        business = validated_data['business']
+
+        _assert_customer_in_business(validated_data.get('customer'), business)
+        for item_data in items_data:
+            _assert_product_in_business(item_data.get('product'), business)
 
         with transaction.atomic():
             if not validated_data.get('customer'):
@@ -70,10 +119,7 @@ class DocumentSerializer(serializers.ModelSerializer):
                 phone = validated_data.get('customer_phone')
                 if name or email:
                     validated_data['customer'] = get_or_create_customer(
-                        business=validated_data['business'],
-                        name=name,
-                        email=email,
-                        phone=phone,
+                        business=business, name=name, email=email, phone=phone,
                     )
 
             document = Document.objects.create(**validated_data)
@@ -87,7 +133,7 @@ class DocumentSerializer(serializers.ModelSerializer):
                 DocumentItem.objects.create(document=document, **item_data)
 
             document.calculate_totals()
-            document.save()
+            document.refresh_stock_status()
 
         return document
 
@@ -95,14 +141,15 @@ class DocumentSerializer(serializers.ModelSerializer):
 class DocumentListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for paginated list views."""
     created_by = DocumentUserSerializer(read_only=True)
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model = Document
         fields = [
             'id', 'document_type', 'status', 'document_number', 'document_date',
-            'customer_name', 'supplier_name', 'currency',
-            'grand_total', 'amount_paid',
-            'is_delivered', 'created_by', 'created_at' ,
+            'customer', 'customer_name', 'supplier_name', 'currency',
+            'grand_total', 'amount_paid', 'returned_credit', 'balance_due', 'stock_deducted_at',
+            'stock_status', 'is_delivered', 'created_by', 'created_at',
         ]
 
 
@@ -113,27 +160,42 @@ class RecentActivitySerializer(serializers.ModelSerializer):
         model = Document
         fields = [
             'id', 'document_number', 'document_type',
-            'customer_name', 'grand_total', 'currency',
-            'status', 'created_at', 'created_by',
+            'customer_name', 'supplier_name', 'grand_total', 'currency', 'stock_deducted_at',
+            'status', 'stock_status', 'created_at', 'created_by',
         ]
 
 
 class DocumentUpdateSerializer(serializers.ModelSerializer):
     """
-    Serializer for updating specific document fields.
-    Restricts sensitive fields like business, totals, and creation details.
+    Updates the editable content of a draft. Status, payment and delivery
+    fields are deliberately NOT here: they change only through the dedicated
+    actions (mark-paid, mark-unpaid, deliver) so the ledger stays consistent.
     """
     items = DocumentItemSerializer(many=True, required=False)
 
     class Meta:
         model = Document
         fields = [
-            'status', 'customer_name', 'customer_email', 'customer_phone', 'items', 'currency', 'notes',
-            'discount', 'tax_rate', 'is_delivered', 'delivered_at', 'amount_paid', 'paid_at'
+            'customer_name', 'customer_email', 'customer_phone', 'supplier_name',
+            'items', 'currency', 'notes', 'discount', 'tax_rate',
         ]
+        extra_kwargs = {
+            'discount': {'min_value': Decimal('0')},
+            'tax_rate': {'min_value': Decimal('0'), 'max_value': Decimal('1')},
+        }
+
+    def validate(self, attrs):
+        items = attrs.get('items')
+        if items:
+            assert_items_within_plan(self.instance.business, items)
+        return attrs
 
     def update(self, instance, validated_data):
         items_data = validated_data.pop('items', None)
+
+        if items_data is not None:
+            for item_data in items_data:
+                _assert_product_in_business(item_data.get('product'), instance.business)
 
         contact_fields_touched = any(
             f in validated_data for f in ('customer_name', 'customer_email', 'customer_phone')
@@ -144,10 +206,7 @@ class DocumentUpdateSerializer(serializers.ModelSerializer):
             phone = validated_data.get('customer_phone', instance.customer_phone)
             if name or email:
                 instance.customer = get_or_create_customer(
-                    business=instance.business,
-                    name=name,
-                    email=email,
-                    phone=phone,
+                    business=instance.business, name=name, email=email, phone=phone,
                 )
 
         instance = super().update(instance, validated_data)
@@ -162,5 +221,5 @@ class DocumentUpdateSerializer(serializers.ModelSerializer):
                 DocumentItem.objects.create(document=instance, **item_data)
 
         instance.calculate_totals()
-        instance.save()
+        instance.refresh_stock_status()
         return instance

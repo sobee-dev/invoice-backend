@@ -9,10 +9,10 @@ class GoogleLogin(SocialLoginView):
     adapter_class = GoogleOAuth2Adapter
 
 urlpatterns = [
-   path('jagaban/', admin.site.urls), 
+   path('jagaban/', admin.site.urls),
    path('api-auth/', include('rest_framework.urls')),
    path('health/', health_check, name='health_check'),
-   
+
     # API endpoints
    path('api/auth/google/', GoogleLogin.as_view(), name='google_login'),
 
@@ -24,7 +24,8 @@ urlpatterns = [
    path('api/inventory/', include('inventory.urls')),
    path('api/staff/', include('staff.urls')),
    path('api/reports/', include('reports.urls')),
+   path('api/payments/', include('payments.urls')),
    path('api/notifications/', include('notifications.urls')),
    path('api/billing/', include('billing.urls')),
-   path('billing/', include('billing.web_urls')),
+   
 ]

@@ -97,6 +97,9 @@ class User(AbstractUser):
     status_reason = models.TextField(blank=True)
     status_changed_at = models.DateTimeField(null=True, blank=True)
     deletion_scheduled_for = models.DateTimeField(null=True, blank=True)
+        # Consent record. Null means the account predates the consent flow.
+    terms_accepted_at = models.DateTimeField(null=True, blank=True)
+    terms_version = models.CharField(max_length=20, blank=True)
     
     # Custom manager
     objects = UserManager()

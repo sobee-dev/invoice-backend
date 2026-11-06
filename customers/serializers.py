@@ -1,6 +1,9 @@
-from rest_framework import serializers
-from .models import Customer
 from decimal import Decimal
+
+from rest_framework import serializers
+
+from .models import Customer
+
 
 class CustomerSerializer(serializers.ModelSerializer):
     lifetime_value = serializers.SerializerMethodField()
@@ -14,13 +17,11 @@ class CustomerSerializer(serializers.ModelSerializer):
             'outstanding_balance', 'lifetime_value',
             'status', 'created_at',
         ]
-        read_only_fields = ['id', 'business', 'created_at']
+        # outstanding_balance is derived from unpaid invoices by the payments
+        # service. A client must never be able to write it.
+        read_only_fields = ['id', 'business', 'created_at', 'outstanding_balance']
 
     def get_lifetime_value(self, obj):
-       
-        # to avoid firing a second aggregate query via the model property.
-        # Falls back to the property for instances that didn't come through
-       
         annotated = getattr(obj, 'ltv', None)
         if annotated is not None:
             return annotated
@@ -36,3 +37,4 @@ class CustomerListSerializer(serializers.ModelSerializer):
             'id', 'full_name', 'email', 'phone', 'lifetime_value',
             'tags', 'outstanding_balance', 'status', 'created_at',
         ]
+        read_only_fields = fields
