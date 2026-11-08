@@ -15,7 +15,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 
-from accounts.permissions import BusinessActivePermission, StaffWithinPlanPermission
+from accounts.permissions import BusinessActivePermission, StaffProductAccessPermission, StaffWithinPlanPermission
 from billing.plans import PRODUCTS, check_limit
 from business.utils import get_user_business
 from documents.exceptions import DomainError
@@ -91,8 +91,13 @@ def _with_stock_annotations(queryset):
 
 class ProductViewSet(viewsets.ModelViewSet):
     permission_classes = [
-        permissions.IsAuthenticated, BusinessActivePermission, StaffWithinPlanPermission,
+        permissions.IsAuthenticated,
+        BusinessActivePermission,
+        StaffWithinPlanPermission,
+        StaffProductAccessPermission,
     ]
+    
+    
     pagination_class = StandardPagination
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 

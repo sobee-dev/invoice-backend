@@ -74,7 +74,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         params = self.request.query_params
 
         # One type, or several separated by commas: ?document_type=sales_invoice,proforma_invoice
-        doc_type = params.get('document_type')
+        doc_type = params.get('document_type') or params.get('documentType')
         if doc_type:
             types = [t.strip() for t in doc_type.split(',') if t.strip()]
             if types:
@@ -84,7 +84,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         if doc_status:
             queryset = queryset.filter(status=doc_status)
 
-        stock_status = params.get('stock_status')
+        stock_status = params.get('stock_status') or params.get('stockStatus')
         if stock_status:
             queryset = queryset.filter(stock_status=stock_status)
 

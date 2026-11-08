@@ -23,6 +23,7 @@ class UserSerializer(serializers.ModelSerializer):
     has_business = serializers.SerializerMethodField()
     full_name = serializers.SerializerMethodField()
     has_password = serializers.SerializerMethodField()
+    permission_level = serializers.SerializerMethodField()
     
     class Meta:
         model = User
@@ -33,6 +34,7 @@ class UserSerializer(serializers.ModelSerializer):
             'last_name',
             'full_name',
             'role',
+            'permission_level',
             'email_verified_at',
             'email_notifications',
             'push_notifications',
@@ -50,6 +52,7 @@ class UserSerializer(serializers.ModelSerializer):
             'email_verified_at',
             'created_at',
             'updated_at',
+            'permission_level',
             'is_staff',
             'has_business',
             'has_password',
@@ -62,6 +65,17 @@ class UserSerializer(serializers.ModelSerializer):
 
     def get_has_password(self, obj):
         return has_real_password(obj)
+    
+    def get_permission_level(self, obj):
+        # Only staff have one. Owners and admins get None.
+        if obj.role != 'staff':
+            return None
+        business = get_user_business(obj)
+        if business is None:
+            return None
+        from staff.models import StaffMember
+        member = StaffMember.objects.filter(user=obj, business=business).first()
+        return member.permission_level if member else None
     
     def get_full_name(self, obj):
         """Get full name from first and last name"""
