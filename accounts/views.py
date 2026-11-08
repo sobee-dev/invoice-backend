@@ -269,7 +269,7 @@ class UserViewSet(viewsets.ModelViewSet):
         user = User.objects.filter(email=email, is_active=True).first()
         if user:
             raw_token = PasswordResetToken.issue(user)
-            reset_url = f"{settings.BACKEND_URL}/reset-password/?token={raw_token}"
+            reset_url = f"{settings.BACKEND_URL}/api/users/reset-password/?token={raw_token}"
             send_password_reset_email(user, reset_url)
 
         return Response({
