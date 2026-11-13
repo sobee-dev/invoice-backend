@@ -324,6 +324,33 @@ class ProductViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @action(detail=False, methods=['get'], url_path='inventory-totals')
+    def inventory_totals(self, request):
+        """
+        GET /api/products/inventory-totals/
+        Total stock value and stock-health counts for active products,
+        without loading every product. Shares the same annotations and
+        STOCK_FILTERS as counts() and the list filter, so these figures
+        always agree with the badges and the stock filter tabs.
+        """
+        business = get_user_business(request.user)
+        if business is None:
+            return Response({'error': 'No business associated with this account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        base = _with_stock_annotations(visible_products(business)).filter(is_active=True)
+        result = base.aggregate(
+            product_count=Count('id'),
+            ok=Count('id', filter=STOCK_FILTERS['ok']),
+            low=Count('id', filter=STOCK_FILTERS['low']),
+            out=Count('id', filter=STOCK_FILTERS['out']),
+            total_value=Coalesce(
+                Sum(F('unit_price') * F('quantity_on_hand')),
+                Value(0),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            ),
+        )
+        return Response(result)
+    
     @action(detail=False, methods=['post'], url_path='bulk-deduct')
     @transaction.atomic
     def bulk_deduct(self, request):
